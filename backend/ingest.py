@@ -1,0 +1,486 @@
+"""AXON ingestion pipeline (MVP).
+
+Mirrors the design doc's pipeline at demo scale:
+UPLOAD -> CLASSIFY -> PARSE -> METADATA -> CHUNK -> INDEX
+                 -> ENTITY EXTRACT -> RELATION DISCOVER -> KG MERGE
+
+Documents are markdown with YAML-ish frontmatter; the P&ID arrives as the
+structured output of the (simulated) vision service.
+"""
+from __future__ import annotations
+
+import csv
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from collections import Counter
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+UPLOADS_DIR = DATA_DIR / "uploads"
+
+TAG_RE = re.compile(r"\b(?:[A-Z]{1,3}-\d{2,3}|SAF-\d+|SOP-\d+|BRG-\d+|MS-\d+|CE-\d+|WO-\d+|MCC-\d-\d+|HS-\d+)\b")
+
+# Concept extraction for arbitrary uploaded documents (design pipeline stage
+# ENTITY EXTRACT). Deterministic, dependency-free: surfaces the document's
+# salient named concepts so the KG can be built from ANY PDF, not just ones
+# that happen to mention seeded equipment tags.
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9+.#-]*")
+_ACRONYM = re.compile(r"^[A-Z]{2,6}s?$")                 # RAG, LCEL, PHA, PHAs
+# each capital hump must be followed by a lowercase run — rejects OCR-mangled
+# tokens like "revIeWS"/"aTure" while keeping RunnableLambda, MultiHeadAttention
+_PASCAL = re.compile(r"^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+$")   # RunnableLambda
+_CAMEL = re.compile(r"^[a-z]{2,}(?:[A-Z][a-z0-9]+)+$")         # fromMessages
+_CODEID = re.compile(r"^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9.]*$")  # x.from
+_TITLE = re.compile(r"^[A-Z][a-z]{2,}$")                 # plain TitleCase word
+
+# Words that are TitleCase but not concepts: common English + book scaffolding.
+_CONCEPT_STOP = {
+    "the", "and", "for", "with", "this", "that", "these", "those", "from",
+    "when", "where", "which", "what", "how", "why", "you", "your", "our",
+    "they", "their", "his", "her", "but", "such", "each", "any", "all", "some",
+    "more", "most", "other", "one", "two", "use", "used", "using", "via", "per",
+    "also", "here", "there", "see", "new", "like", "etc", "get", "set", "let",
+    "however", "every", "true", "false", "real", "build", "building", "code",
+    "project", "practical", "yourself", "larger", "worked", "going", "deeper",
+    "deep", "key", "common", "takeaways", "pitfall", "pitfalls", "practice",
+    "exercise", "interview", "questions", "question", "design", "overview",
+    "summary", "introduction", "conclusion", "contents", "appendix", "guide",
+    "book", "plan", "basics", "basic", "advanced", "chapter", "section", "part",
+    "step", "page", "figure", "table", "example", "note", "first", "second",
+    "next", "before", "after", "january", "february", "march", "april", "may",
+    "june", "july", "august", "september", "october", "november", "december",
+    "because", "therefore", "thus", "hence", "while", "since", "although",
+    "whereas", "moreover", "furthermore", "additionally", "finally", "given",
+    "unlike", "instead", "meanwhile", "however",
+}
+
+
+def _is_concept_token(w: str) -> bool:
+    """High-precision structural test: technical concept names look like
+    acronyms, CamelCase, or code identifiers — not ordinary TitleCase words."""
+    lw = w.lower()
+    if lw.startswith("www.") or lw.endswith((".com", ".org", ".net", ".io")):
+        return False                                    # URLs are not concepts
+    if _ACRONYM.match(w) or _PASCAL.match(w) or _CAMEL.match(w):
+        return True
+    if _CODEID.match(w) and len(w) >= 5:
+        return True
+    return False
+
+
+def _extract_concepts(texts: list[str], top_k: int = 12) -> list[str]:
+    """Return the document's salient concepts. Precision-first: structural
+    terms (CamelCase / acronyms / code ids) plus TitleCase bigrams whose words
+    are not scaffolding. Plain single TitleCase words are dropped as noise."""
+    from collections import Counter
+    df: Counter = Counter()  # concept -> number of chunks it appears in
+    for t in texts:
+        toks = _WORD.findall(t)
+        found: set[str] = set()
+        for w in toks:
+            if len(w) >= 3 and _is_concept_token(w):
+                found.add(w)
+        for i in range(len(toks) - 1):                    # TitleCase bigrams
+            a, b = toks[i], toks[i + 1]
+            if (_TITLE.match(a) and _TITLE.match(b)
+                    and a.lower() not in _CONCEPT_STOP
+                    and b.lower() not in _CONCEPT_STOP):
+                found.add(f"{a} {b}")
+        for c in found:
+            df[c] += 1
+
+    min_df = 2 if len(texts) >= 3 else 1                  # short PDFs: allow df=1
+    cands = {c: f for c, f in df.items() if f >= min_df}
+    in_bigram = {p for c in cands if " " in c for p in c.split()}
+    scored = [(c, f + (1.0 if " " in c else 0.0))         # prefer phrases
+              for c, f in cands.items()
+              if not (" " not in c and c in in_bigram)]    # drop redundant unigrams
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [c for c, _ in scored[:top_k]]
+
+
+
+
+def _extract_keywords(text: str, top_k: int = 12) -> list[str]:
+
+    words = re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text.lower())
+
+    stop = {
+        "the","and","for","with","this","that","from","into",
+        "their","using","used","into","have","has","were",
+        "been","being","will","shall","would","should",
+        "about","than","also","such","there","these","those",
+        "your","they","them","then","which","where","when",
+        "what","does","each","other","more","most","very"
+    }
+
+    words = [
+        w
+        for w in words
+        if len(w) > 2 and w not in stop
+    ]
+
+    return [
+        w
+        for w, _ in Counter(words).most_common(top_k)
+    ]
+
+
+@dataclass
+class Chunk:
+
+    chunk_id: str
+
+    doc_no: str
+
+    doc_title: str
+
+    revision: str
+
+    page: int
+
+    section: str
+
+    subsection: str = ""
+
+    chunk_type: str = "text"
+
+    text: str = ""
+
+    summary: str = ""
+
+    entities: list[str] = field(default_factory=list)
+
+    concepts: list[str] = field(default_factory=list)
+
+    keywords: list[str] = field(default_factory=list)
+
+    token_count: int = 0
+
+@dataclass
+class Corpus:
+    chunks: list[Chunk]
+    docs: dict            # doc_no -> metadata
+    pid: dict             # parsed P&ID topology
+    maintenance: list[dict]
+    spares: list[dict]
+    sensors: list[dict]
+
+
+def _parse_frontmatter(raw: str) -> tuple[dict, str]:
+    meta: dict = {}
+    body = raw
+    if raw.startswith("---"):
+        _, fm, body = raw.split("---", 2)
+        for line in fm.strip().splitlines():
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            v = v.strip()
+            if v.startswith("[") and v.endswith("]"):
+                meta[k.strip()] = [x.strip() for x in v[1:-1].split(",") if x.strip()]
+            else:
+                meta[k.strip()] = v
+    return meta, body.strip()
+
+
+def _summarize_chunk(text: str) -> str:
+    """
+    Lightweight summary.
+
+    We intentionally avoid using an LLM during ingestion.
+    """
+
+    paragraphs = [
+        p.strip()
+        for p in text.split("\n")
+        if p.strip()
+    ]
+
+    if not paragraphs:
+        return ""
+
+    summary = paragraphs[0]
+
+    if len(summary) > 250:
+        summary = summary[:250] + "..."
+
+    return summary
+
+
+def _extract_pdf_text(page) -> str:
+    """Extract PDF text with tighter character spacing.
+
+    Some uploaded papers contain compact glyph positioning. pdfplumber's
+    default tolerance can glue words together ("TheEraof1-bitLLMs"), which
+    damages keyword search and makes real prose look like outline noise.
+    """
+    text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+    return text.strip()
+
+
+def _chunk_markdown(doc_no: str, title: str, revision: str, body: str) -> list[Chunk]:
+    """
+    Structure-aware markdown chunking.
+
+    One chunk per markdown section (## Heading), enriched with metadata.
+    """
+
+    chunks = []
+
+    sections = re.split(r"\n(?=## )", body)
+
+    for i, sec in enumerate(sections):
+
+        sec = sec.strip()
+
+        if not sec:
+            continue
+
+        first_line = sec.splitlines()[0].lstrip("# ").strip()
+
+        section_name = first_line if sec.startswith("#") else "Preamble"
+
+        chunk = Chunk(
+            chunk_id=f"{doc_no}::{i}",
+            doc_no=doc_no,
+            doc_title=title,
+            revision=revision,
+
+            page=1,                          # markdown has no page numbers
+            section=section_name,
+            subsection="",
+            chunk_type="markdown",
+
+            text=sec,
+
+            summary=_summarize_chunk(sec),
+
+            entities=sorted(set(TAG_RE.findall(sec))),
+
+            concepts=[],
+
+            keywords=_extract_keywords(sec),
+
+            token_count=len(sec.split())
+        )
+
+        chunks.append(chunk)
+
+    return chunks
+
+def _chunk_pdf(pdf_path: Path) -> tuple[dict, list[Chunk]]:
+    """
+    Ingest an uploaded PDF.
+
+    Improvements:
+    - Paragraph-aware chunking
+    - Rich metadata
+    - Keyword extraction
+    - Lightweight summaries
+    """
+
+    import pdfplumber
+
+    doc_no = re.sub(r"[^A-Za-z0-9_-]+", "-", pdf_path.stem)[:40]
+
+    chunks: list[Chunk] = []
+
+    mentions: set[str] = set()
+
+    with pdfplumber.open(pdf_path) as pdf:
+
+        for pno, page in enumerate(pdf.pages, start=1):
+
+            text = _extract_pdf_text(page)
+
+            if not text:
+                continue
+
+            paragraphs = [
+                p.strip()
+                for p in text.split("\n\n")
+                if p.strip()
+            ]
+
+            current = ""
+
+            section = f"Page {pno}"
+
+            chunk_index = 0
+
+            for para in paragraphs:
+
+                # Detect headings
+                if len(para) < 80 and para == para.title():
+
+                    section = para
+
+                if len(current) + len(para) > 1200 and current:
+
+                    ents = sorted(set(TAG_RE.findall(current)))
+
+                    mentions.update(ents)
+
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"{doc_no}::p{pno}.{chunk_index}",
+                            doc_no=doc_no,
+                            doc_title=pdf_path.name,
+                            revision="uploaded",
+
+                            page=pno,
+
+                            section=section,
+
+                            subsection="",
+
+                            chunk_type="text",
+
+                            text=current,
+
+                            summary=_summarize_chunk(current),
+
+                            entities=ents,
+
+                            concepts=[],
+
+                            keywords=_extract_keywords(current),
+
+                            token_count=len(current.split()),
+                        )
+                    )
+
+                    chunk_index += 1
+
+                    current = para
+
+                else:
+
+                    current += "\n\n" + para if current else para
+
+            if current:
+
+                ents = sorted(set(TAG_RE.findall(current)))
+
+                mentions.update(ents)
+
+                chunks.append(
+                    Chunk(
+                        chunk_id=f"{doc_no}::p{pno}.{chunk_index}",
+                        doc_no=doc_no,
+                        doc_title=pdf_path.name,
+                        revision="uploaded",
+
+                        page=pno,
+
+                        section=section,
+
+                        subsection="",
+
+                        chunk_type="text",
+
+                        text=current,
+
+                        summary=_summarize_chunk(current),
+
+                        entities=ents,
+
+                        concepts=[],
+
+                        keywords=_extract_keywords(current),
+
+                        token_count=len(current.split()),
+                    )
+                )
+
+    concepts = _extract_concepts(
+        [c.text for c in chunks]
+    ) if chunks else []
+
+    concept_res = [
+        (
+            c,
+            re.compile(r"\b" + re.escape(c) + r"\b", re.I)
+        )
+        for c in concepts
+    ]
+
+    for ch in chunks:
+
+        present = [
+            c
+            for c, rx in concept_res
+            if rx.search(ch.text)
+        ]
+
+        if present:
+
+            ch.concepts = present
+
+            ch.entities = sorted(
+                set(ch.entities) | set(present)
+            )
+
+    meta = {
+        "title": pdf_path.name,
+        "type": "Uploaded",
+        "revision": "uploaded",
+        "mentions": sorted(mentions),
+        "concepts": concepts,
+    }
+
+    return {doc_no: meta}, chunks
+
+def load_corpus() -> Corpus:
+    chunks: list[Chunk] = []
+    docs: dict = {}
+
+    for md in sorted(list((DATA_DIR / "sops").glob("*.md")) + list((DATA_DIR / "manuals").glob("*.md"))):
+        meta, body = _parse_frontmatter(md.read_text())
+        doc_no = meta.get("doc_no", md.stem)
+        docs[doc_no] = meta
+        chunks.extend(_chunk_markdown(doc_no, meta.get("title", md.stem), meta.get("revision", "?"), body))
+
+    # user-uploaded documents (PDF or markdown) — the "add a random PDF" path
+    UPLOADS_DIR.mkdir(exist_ok=True)
+    for up in sorted(UPLOADS_DIR.iterdir()):
+        if up.suffix.lower() == ".pdf":
+            meta_map, pdf_chunks = _chunk_pdf(up)
+            for m in meta_map.values():
+                m["uploaded"] = True
+                m["source_file"] = up.name
+            docs.update(meta_map)
+            chunks.extend(pdf_chunks)
+            chunks.sort(
+                    key=lambda c: (
+                        c.doc_no,
+                        c.page,
+                        c.chunk_id,
+                    )
+                )
+        elif up.suffix.lower() in (".md", ".txt"):
+            meta, body = _parse_frontmatter(up.read_text())
+            doc_no = meta.get("doc_no", up.stem)
+            meta["uploaded"] = True
+            meta["source_file"] = up.name
+            docs[doc_no] = meta
+            chunks.extend(_chunk_markdown(doc_no, meta.get("title", up.stem), meta.get("revision", "?"), body))
+
+    pid = json.loads((DATA_DIR / "pid" / "pid_area1.json").read_text())
+
+    with open(DATA_DIR / "maintenance_log.csv") as f:
+        maintenance = list(csv.DictReader(f))
+    with open(DATA_DIR / "spares.csv") as f:
+        spares = list(csv.DictReader(f))
+    with open(DATA_DIR / "sensors_p101.csv") as f:
+        sensors = [
+            {"timestamp": r["timestamp"],
+             "vibration_mm_s": float(r["vibration_mm_s"]),
+             "bearing_temp_c": float(r["bearing_temp_c"]),
+             "discharge_pressure_bar": float(r["discharge_pressure_bar"])}
+            for r in csv.DictReader(f)
+        ]
+
+    return Corpus(chunks=chunks, docs=docs, pid=pid, maintenance=maintenance, spares=spares, sensors=sensors)

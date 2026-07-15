@@ -1,0 +1,10 @@
+{"id": "g01", "query": "What is the difference between LangChain and LangGraph?", "expected_doc": "langchain", "expected_terms": ["langchain", "langgraph"], "intent": "comparison"}
+{"id": "g02", "query": "What is LCEL?", "expected_doc": "langchain", "expected_terms": ["lcel"], "intent": "definition"}
+{"id": "g03", "query": "How does LangGraph manage state and checkpointing?", "expected_doc": "langchain", "expected_terms": ["state", "checkpoint"]}
+{"id": "g04", "query": "How do I replace the bearing on pump P-101?", "expected_doc": "bearing", "expected_terms": ["bearing", "P-101"]}
+{"id": "g05", "query": "What is the lockout tagout procedure for rotating equipment?", "expected_doc": "lockout", "expected_terms": ["lockout", "tagout"]}
+{"id": "g06", "query": "What vibration level triggers an alarm on Area 1 pumps?", "expected_doc": "vibration", "expected_terms": ["vibration", "alarm"]}
+{"id": "g07", "query": "What is the normal operating procedure for centrifugal pump P-101?", "expected_doc": "operation", "expected_terms": ["pump", "P-101"]}
+{"id": "g08", "query": "What is retrieval augmented generation?", "expected_doc": "langchain", "expected_terms": ["retrieval"], "intent": "definition"}
+{"id": "g09", "query": "Compare LCEL and LangGraph for building agent workflows.", "expected_doc": "langchain", "expected_terms": ["lcel", "langgraph"], "intent": "comparison"}
+{"id": "g10", "query": "What are the specifications in the vendor manual for pump P-101?", "expected_doc": "manual", "expected_terms": ["pump", "CX-200"]}
