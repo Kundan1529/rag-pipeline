@@ -315,6 +315,20 @@ def test_nli_validation_catches_hallucinations_not_truths():
     wrong = "LangChain is a comprehensive knowledge base for AI engineers."
     r3 = v._assess_against_evidence(wrong, ev)
     assert r3["status"] != "SUPPORTED", (r3["score"], r3["nli_entailment"])
+    # (3) conjunctive claims decompose into per-item hypotheses: a correct
+    # list-summary spanning several sentences must be SUPPORTED...
+    conj = ("LangGraph handles cycles, branching, parallelism, and "
+            "human-in-the-loop workflows.")
+    r4 = v._assess_against_evidence(conj, ev)
+    assert r4["status"] == "SUPPORTED", (r4["score"], r4["nli_entailment"])
+    # ...while an enumeration on the WRONG SUBJECT stays caught (premise
+    # fusion was measured to entail this at 0.87 — decomposition keeps the
+    # claim's own subject in every hypothesis).
+    conj_swap = ("LangChain handles cycles, branching, parallelism, and "
+                 "human-in-the-loop workflows.")
+    r5 = v._assess_against_evidence(conj_swap, ev)
+    assert r5["status"] == "INSUFFICIENT_EVIDENCE", (r5["score"],
+                                                     r5["nli_entailment"])
 
 
 # --------------------------------------------- end-to-end (real corpus)

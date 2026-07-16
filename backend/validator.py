@@ -77,7 +77,7 @@ class AnswerValidator:
             flat = " ".join(text.split())
             sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat)
                      if len(s.split()) >= 4]
-            for i in range(len(sents)):
+            for i, sent in enumerate(sents):
                 window = " ".join(sents[i:i + 2])
                 # NLI premises must be ASSERTIONS. A window dominated by
                 # capitalized words is a title, heading, or table — the
@@ -85,9 +85,7 @@ class AnswerValidator:
                 # Practitioner's Guide ...") reads to NLI as entailing
                 # "LangChain is a comprehensive knowledge base" (0.996),
                 # validating a wrong claim from a noun phrase.
-                words = [w for w in window.split() if w[:1].isalpha()]
-                if words and sum(
-                        1 for w in words if w[:1].isupper()) / len(words) >= 0.6:
+                if self._titleish(window):
                     continue
                 overlap = len(claim_toks & self._normalize_tokens(window)) \
                     / len(claim_toks)
@@ -102,13 +100,97 @@ class AnswerValidator:
         if not probs:
             return None
         entail = max(p[0] for p in probs)
+        contra = max(p[1] for p in probs)
+
+        # CONJUNCTIVE claims ("the projects include A, B, and C") draw their
+        # support from several non-adjacent sentences — no single 2-sentence
+        # window can entail the whole conjunction, so a correct list-summary
+        # of resume bullets scored ~0 entailment. Handled by CLAIM-side
+        # decomposition: each conjunct becomes its own hypothesis carrying
+        # the claim's subject+verb ("The projects include a SQL analytics
+        # project."), verified against the same single-assertion windows,
+        # and ALL conjuncts must hold (min) — one fabricated item sinks the
+        # claim. Premise-side fusion was measured UNSAFE: concatenating
+        # sentences with different subjects let NLI entail an entity-swapped
+        # claim at 0.87; per-item hypotheses keep the swap caught (0.998
+        # contradiction) while true list-summaries score 0.99.
+        if entail < 0.5:
+            hyps = self._decompose_conjunctive(claim)
+            if hyps:
+                premises = [w for _, w in
+                            sorted(windows, key=lambda x: -x[0])[:3]]
+                pairs = [(p, h) for h in hyps for p in premises]
+                flat = self._nli_probs_pairs(pairs)
+                if flat:
+                    n = len(premises)
+                    per_item = [
+                        max(flat[i * n:(i + 1) * n], key=lambda x: x[0])
+                        for i in range(len(hyps))
+                    ]
+                    entail = max(entail, min(p[0] for p in per_item))
+                    contra = max(contra, max(p[1] for p in per_item))
+
         # Contradiction is only meaningful when NOTHING entails: if any
-        # window states the claim, another window "contradicting" it is
+        # premise states the claim, another premise "contradicting" it is
         # either a fragment artifact or a different condition being
         # discussed, and must not veto. (Max-ing both independently capped
         # a claim at 0.30 while a window entailed it at 0.992.)
-        contra = max(p[1] for p in probs) if entail < 0.5 else 0.0
+        if entail >= 0.5:
+            contra = 0.0
         return (entail, contra)
+
+    _LIST_VERB_RE = re.compile(
+        r"\b(?:includes?|including|included|are|is|was|were|has|have|"
+        r"provides?|provided|supports?|built|designed|implemented|created|"
+        r"developed|demonstrates?|handles?|covers?|covered|mentions?|"
+        r"such as|like)\b", re.IGNORECASE)
+
+    @staticmethod
+    def _decompose_conjunctive(claim: str) -> list[str] | None:
+        """Split a comma-enumerated claim into per-item hypotheses that keep
+        the claim's own subject+verb. Returns None when the claim is not a
+        comma list or no head verb is found (whole-claim NLI then stands,
+        conservatively)."""
+        body = re.sub(r"\s*\[\d+\]", "", claim).rstrip(" .")
+        parts = [p.strip() for p in
+                 re.split(r",\s*(?:and\s+|or\s+)?", body) if p.strip()]
+        if len(parts) < 3:                     # head+first item, >=2 more
+            return None
+        anchors = list(AnswerValidator._LIST_VERB_RE.finditer(parts[0]))
+        if not anchors:
+            return None
+        head = parts[0][: anchors[-1].end()].strip()
+        first_item = parts[0][anchors[-1].end():].strip()
+        items = ([first_item] if first_item else []) + parts[1:]
+        items = [i for i in items if len(i.split()) >= 2][:4]
+        if len(items) < 2:
+            return None
+        return [f"{head} {item}." for item in items]
+
+    def _nli_probs_pairs(self, pairs: list[tuple[str, str]]
+                         ) -> list[tuple[float, float]]:
+        """(entail, contra) for explicit (premise, hypothesis) pairs."""
+        import math
+        try:
+            logits = self.nli_model.predict(
+                [(p[:600], h) for p, h in pairs])
+        except Exception as exc:
+            print("NLI verification failed:", exc)
+            return []
+        out = []
+        for row in logits:
+            exps = [math.exp(float(x)) for x in row]
+            total = sum(exps) or 1.0
+            out.append((exps[self._nli_ent_idx] / total,
+                        exps[self._nli_con_idx] / total))
+        return out
+
+    @staticmethod
+    def _titleish(text: str) -> bool:
+        """True for title/heading/table text — capitalized-word dominated."""
+        words = [w for w in text.split() if w[:1].isalpha()]
+        return bool(words) and sum(
+            1 for w in words if w[:1].isupper()) / len(words) >= 0.6
     # ---------------------------------------------------------
     def _semantic_score(
     self,
