@@ -544,9 +544,39 @@ def _ingest_docx(path: Path) -> tuple[dict, list[Chunk]]:
                              "\n\n".join(parts), "Uploaded Word")
 
 
+def _ingest_xlsx(path: Path, max_rows: int = 500) -> tuple[dict, list[Chunk]]:
+    """Excel workbooks: every sheet, first row as header, rows rendered as
+    'header: value' lines (same searchable shape as the CSV handler), with
+    the sheet name kept as context."""
+    import openpyxl
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    parts: list[str] = []
+    for ws in wb.worksheets:
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None)
+        if header is None:
+            continue
+        header = [str(h) if h is not None else f"col{i+1}"
+                  for i, h in enumerate(header)]
+        lines = [f"Sheet: {ws.title}", f"Columns: {', '.join(header)}"]
+        for n, row in enumerate(rows):
+            if n >= max_rows:
+                lines.append(f"... ({ws.title}: further rows truncated)")
+                break
+            cells = [f"{h}: {v}" for h, v in zip(header, row)
+                     if v is not None and str(v).strip()]
+            if cells:
+                lines.append("; ".join(cells))
+        parts.append("\n".join(lines))
+    wb.close()
+    return _pack_text_chunks(_doc_no_for(path), path.name,
+                             "\n\n".join(parts), "Uploaded Excel")
+
+
 def _ingest_csv(path: Path, max_rows: int = 500) -> tuple[dict, list[Chunk]]:
+    delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
-        rows = list(csv.reader(f))
+        rows = list(csv.reader(f, delimiter=delimiter))
     if not rows:
         return _pack_text_chunks(_doc_no_for(path), path.name, "", "Uploaded CSV")
     header = rows[0]
@@ -612,6 +642,8 @@ UPLOAD_HANDLERS: dict[str, object] = {
     ".htm": _ingest_html,
     ".docx": _ingest_docx,
     ".csv": _ingest_csv,
+    ".tsv": _ingest_csv,
+    ".xlsx": _ingest_xlsx,
     ".json": _ingest_json_file,
     ".png": _ingest_image,
     ".jpg": _ingest_image,
