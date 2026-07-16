@@ -271,6 +271,41 @@ class AgentSystem:
         return {"entities": entities, "anchor": anchor,
                 "target_docs": self._target_documents(query, entities)}
 
+    # A BM25 hit at/above this score is a confident lexical match; below it
+    # the query is too vague to overturn conversation-based routing.
+    FOLLOWUP_SHIFT_MIN_SCORE = 4.0
+    FOLLOWUP_SHIFT_TOP_K = 5
+
+    def _followup_topic_shift(self, query: str,
+                              inherited_docs: set[str]) -> bool:
+        """True when the query's own corpus evidence CONSENSUS lives outside
+        the documents inherited from the conversation — the user changed
+        topics, so follow-up routing must not fire.
+
+        Without this guard, 'what is transformer' asked after LangChain
+        questions inherited the LangChain PDFs as target_docs, retrieval was
+        scoped to them, and the Attention paper (which holds the answer) was
+        excluded entirely — the same query worked in a fresh chat.
+
+        The test is consensus over the top-k hits, NOT a best-score ratio:
+        measured on the failing query, the paper held ALL top-6 BM25 slots
+        yet a ratio test failed (common words like 'what'/'are' inflate a
+        LangChain chunk to 0.61 of the best score). If not one of the top-k
+        confident hits falls inside the inherited docs, the query is about
+        something else. A genuine follow-up ('explain more about memory')
+        keeps inheritance — its top hits include the inherited docs — and a
+        vague one ('explain more') keeps it via the score floor."""
+        if not inherited_docs:
+            return False
+        hits = self.index._bm25(query)[: self.FOLLOWUP_SHIFT_TOP_K]
+        if not hits or hits[0][1] < self.FOLLOWUP_SHIFT_MIN_SCORE:
+            return False                      # vague query — trust context
+        inside = sum(
+            1 for i, _ in hits
+            if self.index.chunks[i].doc_no in inherited_docs
+        )
+        return inside == 0
+
     def _graph_reasoning(self, query: str, entities: list[str]) -> dict:
         """Graph-first step: detect which graph entities/concepts the query names,
         then TRAVERSE the graph to expand them into a connected context subgraph.
@@ -1248,7 +1283,9 @@ class AgentSystem:
             prev = " ".join(h["content"] for h in history[-4:] if h.get("role") == "user")
             if prev:
                 ctx = self._supervisor(prev + " " + query)
-                if ctx["target_docs"] or ctx["anchor"]:
+                if ((ctx["target_docs"] or ctx["anchor"])
+                        and not self._followup_topic_shift(
+                            query, ctx["target_docs"])):
                     sup["target_docs"] = ctx["target_docs"]
                     sup["entities"] = sup["entities"] or ctx["entities"]
                     anchor = ctx["anchor"]
