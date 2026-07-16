@@ -235,8 +235,13 @@ class AgentSystem:
         self.corpus = corpus
         self.graph = graph
         self.index = index
+        # Validation uses its own calibrated/fast cross-encoder — NOT the
+        # retrieval reranker (bge), whose score distribution doesn't match
+        # the validator's SUPPORTED/PARTIAL thresholds and whose per-pair
+        # latency is too high for claim-level scoring.
+        from retrieval import get_validation_reranker
         self.validator = AnswerValidator(
-            semantic_model=self.index._get_reranker()
+            semantic_model=get_validation_reranker()
         )
 
         self.query_processor = QueryProcessor()

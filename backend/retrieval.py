@@ -8,6 +8,7 @@ sparse leg is BM25 — the stand-in for OpenSearch.
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter, OrderedDict, defaultdict
 try:
@@ -56,6 +57,32 @@ def _tokenize(text: str) -> list[str]:
                 if len(part) >= 3 and part.isalpha():
                     out.append(_singularize(part))
     return out
+
+
+# Validator cross-encoder: deliberately DECOUPLED from the retrieval
+# reranker. The validator's SUPPORTED/PARTIAL thresholds (0.70/0.45) are
+# calibrated to ms-marco MiniLM's wide sigmoid spread, and it scores
+# claim x evidence pairs per answer (dozens of calls) where MiniLM's speed
+# matters. Measured under bge-reranker-base: a supported claim scored 0.731
+# vs 0.540 for a fabricated one — barely separated around those thresholds —
+# and validation latency grew ~10x. Retrieval quality and validation
+# calibration are different jobs; they get different models.
+VALIDATOR_RERANKER_MODEL = os.getenv(
+    "VALIDATOR_RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+).strip()
+
+_validation_reranker = None
+
+
+def get_validation_reranker():
+    """Cached cross-encoder for answer validation (claim-support scoring)."""
+    global _validation_reranker
+    if CrossEncoder is None:
+        return None
+    if _validation_reranker is None:
+        print(f"Loading validation reranker: {VALIDATOR_RERANKER_MODEL}")
+        _validation_reranker = CrossEncoder(VALIDATOR_RERANKER_MODEL)
+    return _validation_reranker
 
 
 def _sigmoid(x: float) -> float:
@@ -277,6 +304,17 @@ class HybridIndex:
         parts.append(chunk.text[: self.RERANK_EVIDENCE_TEXT_LIMIT])
         return "\n".join(parts)
 
+    # Retrieval cross-encoder checkpoint, overridable via env. Default is
+    # bge-reranker-base: measured on this corpus, ms-marco MiniLM misjudged
+    # in both directions (0.78 for a tangential LangSmith page on a
+    # LangChain-vs-LangGraph question — ranked it #1; ~0.0 across the board
+    # on academic prose — collapse). bge fixes both (LangSmith 1->3, paper
+    # scores 0.5+) at ~1.6s warm per retrieve on CPU. Set RERANKER_MODEL to
+    # the MiniLM checkpoint to trade quality back for speed.
+    RERANKER_MODEL = os.getenv(
+        "RERANKER_MODEL", "BAAI/bge-reranker-base"
+    ).strip()
+
     def _get_reranker(self):
         """
         Lazy-load the cross-encoder only when reranking
@@ -287,9 +325,8 @@ class HybridIndex:
             return None
 
         if self._reranker is None:
-            self._reranker = CrossEncoder(
-                "cross-encoder/ms-marco-MiniLM-L-6-v2"
-            )
+            print(f"Loading reranker: {self.RERANKER_MODEL}")
+            self._reranker = CrossEncoder(self.RERANKER_MODEL)
 
         return self._reranker
 
