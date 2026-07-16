@@ -79,7 +79,14 @@ def test_spell_never_touches_valid_or_short_words():
     res = sc.correct("the transformer attention")
     assert res.corrected == "the transformer attention"
     assert not res.corrections
-    assert sc.correct("teh").corrected == "teh"        # < min_token_len
+    # Short tokens are exempt from EDIT-DISTANCE correction, but the user
+    # dictionary (checked before the length guard) may fix known function-
+    # word typos — 'teh' -> 'the', 'si' -> 'is' ('what si transformer'
+    # previously broke the "what is" intent pattern).
+    assert sc.correct("teh").corrected == "the"        # via user dictionary
+    assert sc.correct("what si transformer").corrected \
+        == "what is transformer"
+    assert sc.correct("ax").corrected == "ax"          # short + not in dict
 
 
 def test_spell_user_dictionary_wins():

@@ -163,6 +163,12 @@ class HybridIndex:
             ])))
             for chunk in chunks
         ]
+        # Hyphen-stripped variant: a query entity 'multihead' must match
+        # prose that writes 'multi-head' (and vice versa) — measured cost of
+        # the miss was entity coverage 0.38 instead of 1.0 on on-topic chunks.
+        self._entity_haystacks_dehyphenated: list[str] = [
+            h.replace("-", "") for h in self._entity_haystacks
+        ]
 
         # ------------------------------------------------------------------
         # Document-aware structures: per-document chunk ordering (used for
@@ -250,15 +256,22 @@ class HybridIndex:
         if not entity_terms:
             return 0.0, []
         haystack = self._entity_haystacks[idx]
+        dehyph = self._entity_haystacks_dehyphenated[idx]
         matched = []
         matched_w = total_w = 0.0
         for t in entity_terms:
             w = self._entity_weight(t)
             total_w += w
-            if re.search(
+            hit = re.search(
                 r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])",
                 haystack,
-            ):
+            ) or re.search(
+                # hyphen-insensitive: 'multihead' <-> 'multi-head'
+                r"(?<![a-z0-9])" + re.escape(t.replace("-", ""))
+                + r"(?![a-z0-9])",
+                dehyph,
+            )
+            if hit:
                 matched.append(t)
                 matched_w += w
         return (matched_w / total_w if total_w else 0.0), matched
@@ -742,6 +755,12 @@ class HybridIndex:
         the phrase when the exact phrase is absent."""
         hay = self._entity_haystacks[idx]
         if re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", hay):
+            return True
+        if re.search(
+            r"(?<![a-z0-9])" + re.escape(term.replace("-", ""))
+            + r"(?![a-z0-9])",
+            self._entity_haystacks_dehyphenated[idx],
+        ):
             return True
         toks = [t for t in _tokenize(term) if t not in self._STOPWORDS]
         return bool(toks) and all(

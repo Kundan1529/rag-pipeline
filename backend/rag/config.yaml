@@ -6,7 +6,24 @@ spell:
   long_token_len: 6
   min_token_len: 4            # never correct shorter tokens
   min_confidence: 0.60        # below this the original token is kept
-  user_dictionary: {}         # exact overrides, e.g. {"kubectl": "kubectl"}
+  # Exact overrides, checked BEFORE the min-length guard — the only safe
+  # channel for short-word typos ('what si transformer' broke the "what is"
+  # intent pattern because 2-letter tokens are otherwise never corrected).
+  # Only unambiguous English function-word typos belong here.
+  user_dictionary:
+    si: is
+    teh: the
+    hte: the
+    waht: what
+    whta: what
+    wath: what
+    adn: and
+    nad: and
+    taht: that
+    thier: their
+    wich: which
+    hwo: how
+    fo: of
   protected_extra: []         # extra regexes to protect
 
 classifier:
