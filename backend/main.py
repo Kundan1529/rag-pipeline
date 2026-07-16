@@ -14,7 +14,8 @@ import llm
 import predictive
 from agents import AgentSystem
 from conversations import ConversationStore
-from ingest import DATA_DIR, UPLOADS_DIR, load_corpus
+from ingest import (DATA_DIR, UPLOADS_DIR, load_corpus,
+                    supported_upload_extensions)
 from kg import build_graph
 from knowledge_gaps import GapStore, load_experts, suggest_sme
 from retrieval import HybridIndex
@@ -328,8 +329,10 @@ def list_experts():
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     name = Path(file.filename or "upload.pdf").name  # strip any path components
-    if not name.lower().endswith((".pdf", ".md", ".txt")):
-        raise HTTPException(400, "Only .pdf, .md and .txt files are supported")
+    allowed = supported_upload_extensions()
+    if not name.lower().endswith(allowed):
+        raise HTTPException(
+            400, f"Unsupported file type. Supported: {', '.join(allowed)}")
     dest = UPLOADS_DIR / name
     UPLOADS_DIR.mkdir(exist_ok=True)
     dest.write_bytes(await file.read())

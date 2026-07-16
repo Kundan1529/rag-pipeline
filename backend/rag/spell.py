@@ -104,10 +104,16 @@ class CorpusSpellCorrector:
         return spans
 
     def _confidence(self, token: str, term: str, dist: int) -> float:
+        """Edit distance dominates (0.75); corpus frequency is a tiebreaker
+        (0.25), NOT a gate. With the old 0.6/0.4 split, a distance-1 fix to
+        a corpus-rare word ('detials' -> 'details', a single transposition)
+        scored below the acceptance threshold purely because 'details' is
+        uncommon in the indexed books — vetoing the most reliable class of
+        correction. Rarity should only matter when distance ties."""
         freq = self.vocab.get(term, 1)
         freq_part = math.log(1 + freq) / self._max_log
         dist_part = 1.0 - dist / max(len(token), 1)
-        return round(0.6 * dist_part + 0.4 * freq_part, 3)
+        return round(0.75 * dist_part + 0.25 * freq_part, 3)
 
     def _lookup(self, token: str) -> tuple[str, int] | None:
         d = self.max_edit if len(token) >= self.long_len else 1

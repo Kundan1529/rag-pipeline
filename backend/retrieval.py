@@ -41,7 +41,21 @@ def _singularize(w: str) -> str:
 
 
 def _tokenize(text: str) -> list[str]:
-    return [_singularize(t) for t in _TOKEN_RE.findall(text.lower())]
+    """Shared tokenizer for index and queries. Hyphenated compounds also
+    emit their alphabetic parts: the Attention paper writes 'self-attention'
+    (one token, x23) and never bare 'self', so the query 'self attention'
+    could not match it at all. Emitting ['self-attention', 'self',
+    'attention'] on BOTH sides lets spaced queries meet hyphenated prose
+    while exact compound matches still score highest. Non-alpha parts
+    (P-101 -> 'p', '101') are skipped by the isalpha/length guards."""
+    out: list[str] = []
+    for t in _TOKEN_RE.findall(text.lower()):
+        out.append(_singularize(t))
+        if "-" in t:
+            for part in t.split("-"):
+                if len(part) >= 3 and part.isalpha():
+                    out.append(_singularize(part))
+    return out
 
 
 def _sigmoid(x: float) -> float:
@@ -1013,6 +1027,16 @@ class HybridIndex:
     BM25_SATURATION = 4.0                # bm25/(bm25+SAT) squash
     GRAPH_SATURATION = 3.0               # graph hits needed for full credit
 
+    # Reranker-collapse floor: when even the BEST candidate's cross-encoder
+    # score is below this, the CE is out-of-domain for this query/corpus
+    # (ms-marco MiniLM scores dense academic prose near 0 across the board).
+    # Its 0.45 acceptance weight then zeroes out and every candidate but the
+    # top-1 anchor is rejected — the "only 1 evidence chunk" failure. In
+    # that regime the gate redistributes the reranker's weight over the
+    # remaining signals instead of letting a silent model mismatch veto
+    # perfectly good lexical/dense/entity evidence.
+    CE_COLLAPSE_FLOOR = 0.20
+
     def _acceptance_score(
         self,
         idx: int,
@@ -1022,6 +1046,7 @@ class HybridIndex:
         bm25_scores: dict[int, float],
         graph_scores: dict[int, float],
         graph_entities,
+        weights: dict | None = None,
     ) -> float:
         """Combined evidence-strength score in (0, 1) built exclusively from
         signals the pipeline already computed — no extra inference cost."""
@@ -1036,13 +1061,32 @@ class HybridIndex:
         if graph_entities:
             overlap = len(set(self.chunks[idx].entities) & set(graph_entities))
             entity_n = min(1.0, overlap / self.GRAPH_SATURATION)
-        w = self.ACCEPTANCE_WEIGHTS
+        w = weights or self.ACCEPTANCE_WEIGHTS
         return (w["reranker"] * max(0.0, min(1.0, rerank_score))
                 + w["dense"] * dense
                 + w["bm25"] * bm25_n
                 + w["graph"] * graph_n
                 + w["metadata"] * meta_n
                 + w["entity"] * entity_n)
+
+    def _gate_weights(self, ranked, reranker_scores) -> tuple[dict, bool]:
+        """Acceptance weights for this candidate set. When the cross-encoder
+        has collapsed (best candidate below CE_COLLAPSE_FLOOR — out-of-domain
+        text such as dense academic prose), its weight is redistributed
+        proportionally over the remaining signals so the gate judges on
+        dense/BM25/entity evidence instead of rejecting everything."""
+        best_ce = max(
+            (reranker_scores.get(idx, 0.0) for idx, _, _ in ranked),
+            default=0.0,
+        )
+        if best_ce >= self.CE_COLLAPSE_FLOOR or not reranker_scores:
+            return self.ACCEPTANCE_WEIGHTS, False
+        base = {k: v for k, v in self.ACCEPTANCE_WEIGHTS.items()
+                if k != "reranker"}
+        total = sum(base.values()) or 1.0
+        weights = {k: v / total for k, v in base.items()}
+        weights["reranker"] = 0.0
+        return weights, True
 
     def _evidence_acceptance_gate(
         self,
@@ -1062,6 +1106,11 @@ class HybridIndex:
         acceptance: dict[int, dict] = {}
         thr = self.ACCEPTANCE_THRESHOLD
         reranker_scores = reranker_scores or {}
+        weights, ce_collapsed = self._gate_weights(ranked, reranker_scores)
+        if ce_collapsed:
+            print("⚠️ Reranker collapse: best cross-encoder score below "
+                  f"{self.CE_COLLAPSE_FLOOR} — gating on dense/BM25/entity "
+                  "signals for this query")
         for rank, candidate in enumerate(ranked):
             idx, score, metadata_boost = candidate
             # Use the PURE cross-encoder relevance for the gate's "reranker"
@@ -1072,6 +1121,7 @@ class HybridIndex:
             a = self._acceptance_score(
                 idx, ce_score, metadata_boost,
                 dense_scores, bm25_scores, graph_scores, graph_entities,
+                weights=weights,
             )
             if rank == 0:
                 reason = "top-ranked anchor evidence"

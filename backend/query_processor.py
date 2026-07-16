@@ -91,6 +91,8 @@ class QueryProcessor:
         # (e.g. "LangChain", "LangGraph").
         "key","difference","differences","between","compare","comparison",
         "versus","vs","define","definition","meaning","overview","summary",
+        # "explain X in detail(s)" scaffolding — not entities
+        "detail","details","depth","detailed",
     }
     INTENT_RULES = {
 

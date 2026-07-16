@@ -433,6 +433,197 @@ def _chunk_pdf(pdf_path: Path) -> tuple[dict, list[Chunk]]:
 
     return {doc_no: meta}, chunks
 
+# ---------------------------------------------------------------------------
+# Multi-format upload handlers
+#
+# Each handler: Path -> (meta_map, chunks). New formats register here; the
+# upload endpoint and load_corpus() both dispatch through UPLOAD_HANDLERS,
+# so adding a format is one extractor + one registry line.
+# ---------------------------------------------------------------------------
+
+def _pack_text_chunks(doc_no: str, title: str, text: str,
+                      doc_type: str) -> tuple[dict, list[Chunk]]:
+    """Generic text -> chunks: paragraph packing (~1200 chars), keywords,
+    corpus-wide concept extraction, entity tags — the same enrichment the
+    PDF path gets, for any format that can yield plain text."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks: list[Chunk] = []
+    mentions: set[str] = set()
+    current = ""
+    part = 1
+
+    def flush():
+        nonlocal current, part
+        if not current:
+            return
+        ents = sorted(set(TAG_RE.findall(current)))
+        mentions.update(ents)
+        chunks.append(Chunk(
+            chunk_id=f"{doc_no}::s{part}",
+            doc_no=doc_no, doc_title=title, revision="uploaded",
+            page=part, section=f"Part {part}", chunk_type="text",
+            text=current, summary=_summarize_chunk(current),
+            entities=ents, concepts=[],
+            keywords=_extract_keywords(current),
+            token_count=len(current.split()),
+        ))
+        part += 1
+        current = ""
+
+    for para in paragraphs:
+        if len(current) + len(para) > 1200 and current:
+            flush()
+        current += ("\n\n" + para) if current else para
+    flush()
+
+    concepts = _extract_concepts([c.text for c in chunks]) if chunks else []
+    concept_res = [(c, re.compile(r"\b" + re.escape(c) + r"\b", re.I))
+                   for c in concepts]
+    for ch in chunks:
+        present = [c for c, rx in concept_res if rx.search(ch.text)]
+        if present:
+            ch.concepts = present
+            ch.entities = sorted(set(ch.entities) | set(present))
+
+    meta = {"title": title, "type": doc_type, "revision": "uploaded",
+            "mentions": sorted(mentions), "concepts": concepts}
+    return {doc_no: meta}, chunks
+
+
+def _doc_no_for(path: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", path.stem)[:40]
+
+
+def _extract_html_text(path: Path) -> str:
+    from html.parser import HTMLParser
+
+    class _Stripper(HTMLParser):
+        SKIP = {"script", "style", "noscript"}
+        BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4",
+                 "h5", "h6", "section", "article", "table"}
+
+        def __init__(self):
+            super().__init__()
+            self.parts: list[str] = []
+            self._skip = 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in self.SKIP:
+                self._skip += 1
+            elif tag in self.BLOCK:
+                self.parts.append("\n\n")
+
+        def handle_endtag(self, tag):
+            if tag in self.SKIP and self._skip:
+                self._skip -= 1
+
+        def handle_data(self, data):
+            if not self._skip:
+                self.parts.append(data)
+
+    stripper = _Stripper()
+    stripper.feed(path.read_text(encoding="utf-8", errors="replace"))
+    return "".join(stripper.parts)
+
+
+def _ingest_html(path: Path) -> tuple[dict, list[Chunk]]:
+    return _pack_text_chunks(_doc_no_for(path), path.name,
+                             _extract_html_text(path), "Uploaded HTML")
+
+
+def _ingest_docx(path: Path) -> tuple[dict, list[Chunk]]:
+    import docx  # python-docx
+    d = docx.Document(str(path))
+    parts = [p.text for p in d.paragraphs if p.text.strip()]
+    for table in d.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+    return _pack_text_chunks(_doc_no_for(path), path.name,
+                             "\n\n".join(parts), "Uploaded Word")
+
+
+def _ingest_csv(path: Path, max_rows: int = 500) -> tuple[dict, list[Chunk]]:
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return _pack_text_chunks(_doc_no_for(path), path.name, "", "Uploaded CSV")
+    header = rows[0]
+    lines = []
+    for row in rows[1:max_rows + 1]:
+        # header: value pairs — searchable AND readable for the LLM
+        lines.append("; ".join(f"{h}: {v}" for h, v in zip(header, row) if v))
+    text = f"Columns: {', '.join(header)}\n\n" + "\n".join(lines)
+    return _pack_text_chunks(_doc_no_for(path), path.name, text, "Uploaded CSV")
+
+
+def _ingest_json_file(path: Path, limit: int = 60_000) -> tuple[dict, list[Chunk]]:
+    raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    text = json.dumps(raw, indent=2, ensure_ascii=False)[:limit]
+    return _pack_text_chunks(_doc_no_for(path), path.name, text, "Uploaded JSON")
+
+
+def _ingest_image(path: Path) -> tuple[dict, list[Chunk]]:
+    """Images: OCR text when an engine is available, image metadata always.
+    Degrades honestly — without tesseract the image is still indexed and
+    listed, and its chunk says exactly how to enable text extraction."""
+    meta_lines = [f"Image file: {path.name}"]
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            meta_lines.append(
+                f"Format: {im.format}, size: {im.width}x{im.height}")
+    except Exception:
+        pass
+    ocr_text = ""
+    try:
+        import pytesseract
+        from PIL import Image
+        with Image.open(path) as im:
+            ocr_text = pytesseract.image_to_string(im).strip()
+    except ImportError:
+        meta_lines.append(
+            "OCR not available — install tesseract (brew install tesseract) "
+            "and pytesseract (pip install pytesseract) to index text inside "
+            "images.")
+    except Exception as exc:
+        meta_lines.append(f"OCR failed: {exc}")
+    body = "\n".join(meta_lines)
+    if ocr_text:
+        body += "\n\nExtracted text (OCR):\n\n" + ocr_text
+    return _pack_text_chunks(_doc_no_for(path), path.name, body,
+                             "Uploaded Image")
+
+
+def _ingest_markdown_file(path: Path) -> tuple[dict, list[Chunk]]:
+    meta, body = _parse_frontmatter(path.read_text())
+    doc_no = meta.get("doc_no", path.stem)
+    meta.setdefault("title", path.stem)
+    return {doc_no: meta}, _chunk_markdown(
+        doc_no, meta.get("title", path.stem), meta.get("revision", "?"), body)
+
+
+UPLOAD_HANDLERS: dict[str, object] = {
+    ".pdf": _chunk_pdf,
+    ".md": _ingest_markdown_file,
+    ".txt": _ingest_markdown_file,
+    ".html": _ingest_html,
+    ".htm": _ingest_html,
+    ".docx": _ingest_docx,
+    ".csv": _ingest_csv,
+    ".json": _ingest_json_file,
+    ".png": _ingest_image,
+    ".jpg": _ingest_image,
+    ".jpeg": _ingest_image,
+    ".webp": _ingest_image,
+}
+
+
+def supported_upload_extensions() -> tuple[str, ...]:
+    return tuple(sorted(UPLOAD_HANDLERS))
+
+
 def load_corpus() -> Corpus:
     chunks: list[Chunk] = []
     docs: dict = {}
@@ -443,30 +634,30 @@ def load_corpus() -> Corpus:
         docs[doc_no] = meta
         chunks.extend(_chunk_markdown(doc_no, meta.get("title", md.stem), meta.get("revision", "?"), body))
 
-    # user-uploaded documents (PDF or markdown) — the "add a random PDF" path
+    # User-uploaded documents — any format with a registered handler
+    # (PDF, markdown, HTML, Word, CSV, JSON, images, ...).
     UPLOADS_DIR.mkdir(exist_ok=True)
     for up in sorted(UPLOADS_DIR.iterdir()):
+        handler = UPLOAD_HANDLERS.get(up.suffix.lower())
+        if handler is None:
+            if up.is_file() and not up.name.startswith("."):
+                print(f"ingest: skipping {up.name} — no handler for "
+                      f"'{up.suffix}' (supported: "
+                      f"{', '.join(supported_upload_extensions())})")
+            continue
+        try:
+            meta_map, up_chunks = handler(up)
+        except Exception as exc:
+            print(f"ingest: failed to parse {up.name}: {exc}")
+            continue
+        for m in meta_map.values():
+            m["uploaded"] = True
+            m["source_file"] = up.name
+        docs.update(meta_map)
+        chunks.extend(up_chunks)
         if up.suffix.lower() == ".pdf":
-            meta_map, pdf_chunks = _chunk_pdf(up)
-            for m in meta_map.values():
-                m["uploaded"] = True
-                m["source_file"] = up.name
-            docs.update(meta_map)
-            chunks.extend(pdf_chunks)
-            chunks.sort(
-                    key=lambda c: (
-                        c.doc_no,
-                        c.page,
-                        c.chunk_id,
-                    )
-                )
-        elif up.suffix.lower() in (".md", ".txt"):
-            meta, body = _parse_frontmatter(up.read_text())
-            doc_no = meta.get("doc_no", up.stem)
-            meta["uploaded"] = True
-            meta["source_file"] = up.name
-            docs[doc_no] = meta
-            chunks.extend(_chunk_markdown(doc_no, meta.get("title", up.stem), meta.get("revision", "?"), body))
+            # preserve the original PDF ordering behaviour exactly
+            chunks.sort(key=lambda c: (c.doc_no, c.page, c.chunk_id))
 
     pid = json.loads((DATA_DIR / "pid" / "pid_area1.json").read_text())
 
