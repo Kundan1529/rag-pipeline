@@ -12,3 +12,31 @@
 {"id": "g12", "query": "what is multi-head attention", "expected_doc": "attention", "expected_terms": ["multi-head", "attention"], "intent": "definition"}
 {"id": "g13", "query": "why did the transformer replace recurrent networks?", "expected_doc": "attention", "expected_terms": ["recurrent", "attention"], "intent": "reasoning"}
 {"id": "g14", "query": "what BLEU score did the transformer achieve on English-to-German translation?", "expected_doc": "attention", "expected_terms": ["BLEU", "transformer"]}
+{"id": "g15", "category": "misspelled", "query": "what is a trnasformer architecture?", "expected_doc": "attention", "expected_terms": ["transformer"], "intent": "definition"}
+{"id": "g16", "category": "misspelled", "query": "explain the atention mechanism in detail", "expected_doc": "attention", "expected_terms": ["attention"]}
+{"id": "g17", "category": "misspelled", "query": "berring replacement procedure for pump P-101", "expected_doc": "bearing", "expected_terms": ["bearing", "P-101"]}
+{"id": "g18", "category": "misspelled", "query": "what is the diffrence between LCEL and langraph", "expected_doc": "langchain", "expected_terms": ["lcel", "langgraph"], "intent": "comparison"}
+{"id": "g19", "category": "synonym", "query": "how do I swap out the bearing on the pump?", "expected_doc": "bearing", "expected_terms": ["bearing"]}
+{"id": "g20", "category": "synonym", "query": "energy isolation steps before maintenance work", "expected_doc": "lockout", "expected_terms": ["isolation"]}
+{"id": "g21", "category": "synonym", "query": "tracing and observability for LangChain applications", "expected_doc": "langchain", "expected_terms": ["tracing", "langsmith"]}
+{"id": "g22", "category": "short", "query": "attention", "expected_doc": "attention", "expected_terms": ["attention"]}
+{"id": "g23", "category": "short", "query": "memory", "expected_doc": "langchain", "expected_terms": ["memory"]}
+{"id": "g24", "category": "short", "query": "checkpointing", "expected_doc": "langchain", "expected_terms": ["checkpoint"]}
+{"id": "g25", "category": "reasoning", "query": "why is multi-head attention better than a single attention head?", "expected_doc": "attention", "expected_terms": ["attention", "head"], "intent": "reasoning"}
+{"id": "g26", "category": "procedure", "query": "steps to shut down pump P-101 safely", "expected_doc": "operation", "expected_terms": ["shutdown", "P-101"]}
+{"id": "g27", "category": "procedure", "query": "how do I restore equipment after lockout tagout?", "expected_doc": "lockout", "expected_terms": ["restoration"]}
+{"id": "g28", "category": "numeric", "query": "what vibration level is the danger limit for the pumps?", "expected_doc": "vibration", "expected_terms": ["7.1"]}
+{"id": "g29", "category": "numeric", "query": "how many identical layers does the transformer encoder stack have?", "expected_doc": "attention", "expected_terms": ["6"]}
+{"id": "g30", "category": "multi_doc", "query": "compare the Transformer architecture with LangGraph", "expected_docs": ["attention", "langchain"], "expected_terms": ["transformer", "langgraph"], "intent": "comparison"}
+{"id": "g31", "category": "multi_doc", "query": "what do the vendor manual and the bearing SOP say about P-101 bearings?", "expected_docs": ["manual", "bearing"], "expected_terms": ["bearing"]}
+{"id": "g32", "category": "adversarial", "query": "LangGraph LangChain difference key what", "expected_doc": "langchain", "expected_terms": ["langgraph"], "intent": "comparison"}
+{"id": "g33", "category": "adversarial", "query": "I heard LangGraph cannot handle cycles - verify against the documentation", "expected_doc": "langchain", "expected_terms": ["cycles"]}
+{"id": "g34", "category": "definition", "query": "what is LCEL and what does the pipe operator do?", "expected_doc": "langchain", "expected_terms": ["lcel", "pipe"], "intent": "definition", "expected_answer_terms": ["LCEL", "pipe"]}
+{"id": "g35", "category": "definition", "query": "what is scaled dot-product attention?", "expected_doc": "attention", "expected_terms": ["scaled", "dot-product"], "intent": "definition", "expected_answer_terms": ["queries", "keys"]}
+{"id": "g36", "category": "definition", "query": "what are output parsers in LangChain?", "expected_doc": "langchain", "expected_terms": ["parser"], "intent": "definition"}
+{"id": "g37", "category": "definition", "query": "what is MCP and what problem does it solve?", "expected_doc": "langchain", "expected_terms": ["mcp", "tool"]}
+{"id": "g38", "category": "reasoning", "query": "when should I use an agent instead of a chain?", "expected_doc": "langchain", "expected_terms": ["agent", "chain"]}
+{"id": "n01", "category": "negative", "query": "What is the pricing of LangSmith enterprise?", "expect_refusal": true}
+{"id": "n02", "category": "negative", "query": "Who is the CEO of LangChain?", "expect_refusal": true}
+{"id": "n03", "category": "negative", "query": "What is the capital of France?", "expect_refusal": true}
+{"id": "n04", "category": "negative", "query": "What does SOP-999 say about turbine maintenance?", "expect_refusal": true}
