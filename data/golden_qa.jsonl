@@ -8,3 +8,7 @@
 {"id": "g08", "query": "What is retrieval augmented generation?", "expected_doc": "langchain", "expected_terms": ["retrieval"], "intent": "definition"}
 {"id": "g09", "query": "Compare LCEL and LangGraph for building agent workflows.", "expected_doc": "langchain", "expected_terms": ["lcel", "langgraph"], "intent": "comparison"}
 {"id": "g10", "query": "What are the specifications in the vendor manual for pump P-101?", "expected_doc": "manual", "expected_terms": ["pump", "CX-200"]}
+{"id": "g11", "query": "what is a transformer?", "expected_doc": "attention", "expected_terms": ["transformer", "attention"], "intent": "definition"}
+{"id": "g12", "query": "what is multi-head attention", "expected_doc": "attention", "expected_terms": ["multi-head", "attention"], "intent": "definition"}
+{"id": "g13", "query": "why did the transformer replace recurrent networks?", "expected_doc": "attention", "expected_terms": ["recurrent", "attention"], "intent": "reasoning"}
+{"id": "g14", "query": "what BLEU score did the transformer achieve on English-to-German translation?", "expected_doc": "attention", "expected_terms": ["BLEU", "transformer"]}
