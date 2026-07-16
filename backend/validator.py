@@ -13,8 +13,78 @@ import re
 
 class AnswerValidator:
 
-    def __init__(self, semantic_model=None, ):
+    def __init__(self, semantic_model=None, nli_model=None):
         self.semantic_model = semantic_model
+        # Optional NLI second stage. The relevance model measures "is this
+        # claim ABOUT this text" and scores an entity-swapped claim
+        # ("LangChain is X" vs evidence saying "LangGraph is X") identically
+        # to the true one; NLI measures "does this text STATE this claim".
+        self.nli_model = nli_model
+        self._nli_ent_idx = None
+        self._nli_con_idx = None
+        if nli_model is not None:
+            try:
+                id2label = nli_model.model.config.id2label
+                self._nli_ent_idx = next(
+                    i for i, l in id2label.items()
+                    if l.lower().startswith("entail"))
+                self._nli_con_idx = next(
+                    i for i, l in id2label.items()
+                    if l.lower().startswith("contra"))
+            except Exception:
+                self.nli_model = None
+
+    def _nli_probs(self, claim: str,
+                   premises: list[str]) -> list[tuple[float, float]]:
+        """(P(entailment), P(contradiction)) of the claim against each
+        premise (premise=evidence, hypothesis=claim)."""
+        import math
+        try:
+            logits = self.nli_model.predict(
+                [(p[:600], claim) for p in premises])
+        except Exception as exc:
+            print("NLI verification failed:", exc)
+            return []
+        out = []
+        for row in logits:
+            exps = [math.exp(float(x)) for x in row]
+            total = sum(exps) or 1.0
+            out.append((exps[self._nli_ent_idx] / total,
+                        exps[self._nli_con_idx] / total))
+        return out
+
+    def _nli_support(self, claim: str, texts: list[str],
+                     max_windows: int = 4) -> tuple[float, float] | None:
+        """Best (entailment, contradiction) over SENTENCE WINDOWS of the
+        evidence. NLI models are calibrated for sentence-pair premises, not
+        1,500-char chunks — measured on the entity-swap probe, entailment
+        against the clean two-sentence premise is 0.002 (contradiction
+        0.99), but against the full chunk it degrades to 0.68 and the swap
+        slips through. Windows of two consecutive sentences are ranked by
+        lexical overlap with the claim (the sentences that could support it)
+        and only the top few are scored, in one batched call."""
+        claim_toks = self._normalize_tokens(claim)
+        if not claim_toks:
+            return None
+        windows: list[tuple[float, str]] = []
+        for text in texts:
+            sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n", text)
+                     if len(s.split()) >= 4]
+            for i in range(len(sents)):
+                window = " ".join(sents[i:i + 2])
+                overlap = len(claim_toks & self._normalize_tokens(window)) \
+                    / len(claim_toks)
+                windows.append((overlap, window))
+        if not windows:
+            return None
+        windows.sort(key=lambda x: -x[0])
+        chosen = [w for ov, w in windows[:max_windows] if ov >= 0.2]
+        if not chosen:
+            chosen = [w for _, w in windows[:2]]
+        probs = self._nli_probs(claim, chosen)
+        if not probs:
+            return None
+        return (max(p[0] for p in probs), max(p[1] for p in probs))
     # ---------------------------------------------------------
     def _semantic_score(
     self,
@@ -481,6 +551,33 @@ class AnswerValidator:
                 best["evidence_id"]
             ]
 
+        # NLI second stage (monotone tightener): runs only on claims the
+        # relevance stage would bless, against the top evidence candidates.
+        # Entailment can only LOWER the score, never raise it — relevance
+        # calibration is preserved for cases NLI is unsure about, while
+        # entity-swapped / plausible-but-wrong claims (relevance ~1.0,
+        # entailment ~0.0) drop below the support thresholds. A hard
+        # contradiction (evidence states otherwise) caps the score outright.
+        nli_entailment = None
+        nli_contradiction = None
+        if self.nli_model is not None and final_score >= 0.45:
+            top_texts = [
+                str(item["chunk"].get("text", ""))
+                for item in (synthesis_candidates or [best])[:2]
+                if item["chunk"].get("text")
+            ]
+            support = self._nli_support(clean_claim, top_texts)
+            if support is not None:
+                nli_entailment = round(support[0], 3)
+                nli_contradiction = round(support[1], 3)
+                lex_part = (combined_lexical
+                            if support_mode == "MULTI_EVIDENCE_SYNTHESIS"
+                            else best["lexical_score"])
+                strict = 0.70 * nli_entailment + 0.30 * lex_part
+                final_score = min(final_score, strict)
+                if nli_contradiction >= 0.90:
+                    final_score = min(final_score, 0.30)
+
         # Numeric grounding check: semantic similarity cannot tell a real
         # number from a fabricated one ("released in 2019", "10x faster").
         # If the claim asserts digit-numbers that appear in NONE of the
@@ -511,6 +608,9 @@ class AnswerValidator:
         return {
             "score": round(final_score, 2),
             "status": status,
+
+            "nli_entailment": nli_entailment,
+            "nli_contradiction": nli_contradiction,
 
             "unsupported_numbers": unsupported_numbers,
 

@@ -239,9 +239,10 @@ class AgentSystem:
         # retrieval reranker (bge), whose score distribution doesn't match
         # the validator's SUPPORTED/PARTIAL thresholds and whose per-pair
         # latency is too high for claim-level scoring.
-        from retrieval import get_validation_reranker
+        from retrieval import get_nli_verifier, get_validation_reranker
         self.validator = AnswerValidator(
-            semantic_model=get_validation_reranker()
+            semantic_model=get_validation_reranker(),
+            nli_model=get_nli_verifier(),
         )
 
         self.query_processor = QueryProcessor()

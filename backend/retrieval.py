@@ -73,6 +73,21 @@ VALIDATOR_RERANKER_MODEL = os.getenv(
 
 _validation_reranker = None
 
+# NLI entailment model for the validator's second stage. Relevance models
+# cannot catch entity-swapped or plausible-but-wrong claims (measured:
+# ms-marco scores "LangChain is a library for stateful workflows" 1.000
+# against a chunk that says LANGGRAPH is — identical to the true claim).
+# nli-deberta-v3-small separates the same five test cases perfectly
+# (entailment 0.98/0.00/0.00/1.00/0.00) at ~190ms/pair CPU, so it runs
+# only on the top evidence candidates of claims relevance would bless.
+# Set env NLI_VALIDATOR_MODEL="" to disable.
+NLI_VALIDATOR_MODEL = os.getenv(
+    "NLI_VALIDATOR_MODEL", "cross-encoder/nli-deberta-v3-small"
+).strip()
+
+_nli_verifier = None
+_nli_failed = False
+
 
 def get_validation_reranker():
     """Cached cross-encoder for answer validation (claim-support scoring)."""
@@ -83,6 +98,23 @@ def get_validation_reranker():
         print(f"Loading validation reranker: {VALIDATOR_RERANKER_MODEL}")
         _validation_reranker = CrossEncoder(VALIDATOR_RERANKER_MODEL)
     return _validation_reranker
+
+
+def get_nli_verifier():
+    """Cached NLI cross-encoder for entailment verification, or None when
+    disabled/unavailable (the validator then behaves exactly as before)."""
+    global _nli_verifier, _nli_failed
+    if CrossEncoder is None or not NLI_VALIDATOR_MODEL or _nli_failed:
+        return None
+    if _nli_verifier is None:
+        try:
+            print(f"Loading NLI verifier: {NLI_VALIDATOR_MODEL}")
+            _nli_verifier = CrossEncoder(NLI_VALIDATOR_MODEL)
+        except Exception as exc:
+            print(f"NLI verifier unavailable (non-fatal): {exc}")
+            _nli_failed = True
+            return None
+    return _nli_verifier
 
 
 def _sigmoid(x: float) -> float:
