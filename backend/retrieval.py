@@ -1207,15 +1207,23 @@ class HybridIndex:
         graph_scores: dict[int, float],
         graph_entities,
         reranker_scores: dict[int, float] | None = None,
+        relaxed: bool = False,
     ) -> tuple[list[tuple[int, float, float]], dict[int, dict]]:
         """Stage: evaluate every reranked candidate and reject obviously weak
         evidence before it reaches the LLM. The top-ranked candidate always
         passes (it anchors the answer — if even it is weak, the downstream
         grounded-or-refuse gate fires, exactly as before). Returns the
-        accepted candidates plus per-chunk acceptance diagnostics."""
+        accepted candidates plus per-chunk acceptance diagnostics.
+
+        relaxed=True (retrieval scoped to ONE small document): completeness
+        beats precision — the user named the document, so rejecting its
+        chunks for weak query-term overlap produces incomplete answers.
+        Measured failure: 'tell me the projects in the resume' kept 3 of 6
+        resume chunks because the parts listing three of the five projects
+        never use the word 'project'; the answer then omitted them."""
         accepted: list[tuple[int, float, float]] = []
         acceptance: dict[int, dict] = {}
-        thr = self.ACCEPTANCE_THRESHOLD
+        thr = 0.0 if relaxed else self.ACCEPTANCE_THRESHOLD
         reranker_scores = reranker_scores or {}
         for rank, candidate in enumerate(ranked):
             idx, score, metadata_boost = candidate
@@ -1478,10 +1486,15 @@ class HybridIndex:
         # Ranking proposed; the gate disposes. Weak candidates are rejected
         # here (with recorded reasons) before document reranking so they can
         # never be sent to the LLM.
+        single_small_doc = (
+            doc_filter is not None and len(doc_filter) == 1
+            and len(self._doc_positions.get(next(iter(doc_filter)), [])) <= 12
+        )
         reranked, acceptance = self._evidence_acceptance_gate(
             reranked,
             dense_scores, bm25_scores, graph_scores, graph_entities,
             reranker_scores=reranker_scores,
+            relaxed=single_small_doc,
         )
 
         # ---- Stage 8: document-level reranking ----------------------------

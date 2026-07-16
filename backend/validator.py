@@ -375,6 +375,27 @@ class AnswerValidator:
                     if sentence.rstrip("*_` ").endswith("?"):
                         continue
 
+                    # Skip evidence-metadata ECHOES ("Relevance: medium,
+                    # Entities: CUDA, Content: Built ...") — small models
+                    # copy case-file header lines into answers — and
+                    # meta-citation filler ("This project is mentioned in
+                    # [1].", "This is supported by [3]."): statements about
+                    # citations, not facts. Both classes produced spurious
+                    # INSUFFICIENT_EVIDENCE warnings.
+                    if re.match(
+                        r"^\s*(?:\[\d+\]\s*)?(?:Relevance|Entities|Content|"
+                        r"Source|Keywords|Concepts)\s*:", sentence,
+                    ):
+                        continue
+                    if re.fullmatch(
+                        r"(?:\[\d+\]\s*)?(?:This|It|These|Those)"
+                        r"(?:\s+[\w-]+){0,4}\s+(?:is|are)\s+"
+                        r"(?:mentioned|supported|described|documented)\s+"
+                        r"(?:in|by)\s+\[\d+\]\s*\.?",
+                        sentence, re.IGNORECASE,
+                    ):
+                        continue
+
                     # Skip dangling structural introductions
                     if re.search(
                         r"""
