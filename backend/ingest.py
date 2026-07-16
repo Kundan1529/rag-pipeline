@@ -270,6 +270,46 @@ def _chunk_markdown(doc_no: str, title: str, revision: str, body: str) -> list[C
 
     return chunks
 
+def _strip_running_headers(page_texts: list[tuple[int, str]]
+                           ) -> list[tuple[int, str]]:
+    """Remove running page headers from extracted PDF pages.
+
+    A book's header ("LangChain Complete Knowledge Base | For AI Engineer
+    Roles") is repeated as the first line of nearly every page. Left in the
+    chunk text it is poison twice over: the generator reads it as content
+    (producing 'LangChain is a comprehensive knowledge base for AI
+    engineers' — confusing the library with the DOCUMENT TITLE), and the
+    claim validator then finds lexical support for that wrong claim in
+    every chunk. Detection: a first line (or its 4-word prefix, for headers
+    with varying chapter suffixes) that repeats on >=30% of pages is a
+    running header, not content."""
+    if len(page_texts) < 4:
+        return page_texts
+    firsts = [t.split("\n", 1)[0].strip() for _, t in page_texts if t.strip()]
+    n = len(firsts) or 1
+    threshold = max(3, int(0.3 * n))
+    exact = Counter(firsts)
+    prefix = Counter(
+        " ".join(f.split()[:4]) for f in firsts if len(f.split()) >= 4)
+
+    def clean(text: str) -> str:
+        head, sep, rest = text.partition("\n")
+        h = head.strip()
+        if not h:
+            return text
+        if exact[h] >= threshold:
+            return rest
+        words = h.split()
+        if len(words) >= 4:
+            p = " ".join(words[:4])
+            if prefix[p] >= threshold:
+                remainder = " ".join(words[4:])
+                return (remainder + sep + rest) if remainder else rest
+        return text
+
+    return [(pno, clean(t)) for pno, t in page_texts]
+
+
 def _chunk_pdf(pdf_path: Path) -> tuple[dict, list[Chunk]]:
     """
     Ingest an uploaded PDF.
@@ -279,6 +319,7 @@ def _chunk_pdf(pdf_path: Path) -> tuple[dict, list[Chunk]]:
     - Rich metadata
     - Keyword extraction
     - Lightweight summaries
+    - Running-header removal
     """
 
     import pdfplumber
@@ -290,10 +331,17 @@ def _chunk_pdf(pdf_path: Path) -> tuple[dict, list[Chunk]]:
     mentions: set[str] = set()
 
     with pdfplumber.open(pdf_path) as pdf:
+        page_texts = [
+            (pno, text)
+            for pno, page in enumerate(pdf.pages, start=1)
+            if (text := _extract_pdf_text(page))
+        ]
 
-        for pno, page in enumerate(pdf.pages, start=1):
+    page_texts = _strip_running_headers(page_texts)
 
-            text = _extract_pdf_text(page)
+    if True:  # preserve original indentation of the chunking loop below
+
+        for pno, text in page_texts:
 
             if not text:
                 continue
