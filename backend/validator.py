@@ -68,10 +68,27 @@ class AnswerValidator:
             return None
         windows: list[tuple[float, str]] = []
         for text in texts:
-            sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n", text)
+            # Join hard-wrapped PDF lines BEFORE sentence-splitting.
+            # Splitting on newlines produced mid-sentence fragments like
+            # "subspaces at different positions. With a single attention
+            # head, averaging inhibits this." — half of one sentence glued
+            # to the inverse-condition sentence — which NLI judged a 0.98
+            # CONTRADICTION of a verbatim-true claim.
+            flat = " ".join(text.split())
+            sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat)
                      if len(s.split()) >= 4]
             for i in range(len(sents)):
                 window = " ".join(sents[i:i + 2])
+                # NLI premises must be ASSERTIONS. A window dominated by
+                # capitalized words is a title, heading, or table — the
+                # book's cover ("LangChain for AI Engineers — A Complete
+                # Practitioner's Guide ...") reads to NLI as entailing
+                # "LangChain is a comprehensive knowledge base" (0.996),
+                # validating a wrong claim from a noun phrase.
+                words = [w for w in window.split() if w[:1].isalpha()]
+                if words and sum(
+                        1 for w in words if w[:1].isupper()) / len(words) >= 0.6:
+                    continue
                 overlap = len(claim_toks & self._normalize_tokens(window)) \
                     / len(claim_toks)
                 windows.append((overlap, window))
@@ -84,7 +101,14 @@ class AnswerValidator:
         probs = self._nli_probs(claim, chosen)
         if not probs:
             return None
-        return (max(p[0] for p in probs), max(p[1] for p in probs))
+        entail = max(p[0] for p in probs)
+        # Contradiction is only meaningful when NOTHING entails: if any
+        # window states the claim, another window "contradicting" it is
+        # either a fragment artifact or a different condition being
+        # discussed, and must not veto. (Max-ing both independently capped
+        # a claim at 0.30 while a window entailed it at 0.992.)
+        contra = max(p[1] for p in probs) if entail < 0.5 else 0.0
+        return (entail, contra)
     # ---------------------------------------------------------
     def _semantic_score(
     self,

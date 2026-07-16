@@ -272,6 +272,51 @@ def test_clarification_short_circuits():
     assert result["status"] == "CLARIFY" and len(result["options"]) == 3
 
 
+# ----------------------------------------------------- NLI validation
+
+def test_nli_validation_catches_hallucinations_not_truths():
+    """Locks in the NLI second stage's contract after two same-day
+    regressions: (1) max-contradiction across windows must not veto an
+    entailed claim (PDF line-wrap fragments scored 0.98 contradiction on
+    verbatim-true text); (2) title/heading windows must not serve as
+    premises (a book cover 'A Complete Practitioner's Guide...' entailed
+    'LangChain is a comprehensive knowledge base' at 0.996)."""
+    from validator import AnswerValidator
+    from retrieval import get_nli_verifier, get_validation_reranker
+    v = AnswerValidator(semantic_model=get_validation_reranker(),
+                        nli_model=get_nli_verifier())
+    if v.nli_model is None:
+        return  # NLI disabled in this environment — nothing to lock in
+    ev = [
+        {"evidence_id": 1, "doc_no": "D1", "section": "s", "keywords": [],
+         "concepts": [], "entities": [], "summary": "",
+         # hard line-wraps mid-sentence, exactly like extracted PDF text
+         "text": ("LangGraph is a library for building stateful, multi-step "
+                  "AI workflows\nas directed graphs. It handles cycles, "
+                  "branching, parallelism,\nhuman-in-the-loop, and "
+                  "persistence. With a single simple chain,\nlooping is not "
+                  "possible.")},
+        {"evidence_id": 2, "doc_no": "D2", "section": "s", "keywords": [],
+         "concepts": [], "entities": [], "summary": "",
+         # title-page style content: capitalized noun phrases, no assertions
+         "text": ("LangChain for AI Engineers A Complete Practitioner's "
+                  "Guide To LangChain, LangGraph & Production LLM Systems "
+                  "From Prompt Templates To Production Deployment")},
+    ]
+    true_claim = ("LangGraph is a library for building stateful multi-step "
+                  "AI workflows as directed graphs.")
+    r = v._assess_against_evidence(true_claim, ev)
+    assert r["status"] == "SUPPORTED", (r["score"], r["nli_entailment"],
+                                        r["nli_contradiction"])
+    swap = ("LangChain is a library for building stateful multi-step AI "
+            "workflows as directed graphs.")
+    r2 = v._assess_against_evidence(swap, ev)
+    assert r2["status"] == "INSUFFICIENT_EVIDENCE", r2["score"]
+    wrong = "LangChain is a comprehensive knowledge base for AI engineers."
+    r3 = v._assess_against_evidence(wrong, ev)
+    assert r3["status"] != "SUPPORTED", (r3["score"], r3["nli_entailment"])
+
+
 # --------------------------------------------- end-to-end (real corpus)
 
 def test_understanding_on_real_corpus():
