@@ -32,3 +32,6 @@ data/eval_results.json
 # The markdown demo corpus (data/sops, data/manuals) IS tracked; uploaded
 # PDFs are not. Delete this line if you want them committed.
 data/uploads/*.pdf
+# --- Runtime app state (regenerated on run; not source) ---
+data/conversations.json
+data/knowledge_gaps.json
