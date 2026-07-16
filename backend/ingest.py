@@ -656,8 +656,18 @@ def _ingest_image(path: Path) -> tuple[dict, list[Chunk]]:
         pass
     ocr_text = ""
     try:
+        import shutil
         import pytesseract
         from PIL import Image
+        # Servers launched from IDEs/launchers often have a minimal PATH
+        # without Homebrew; locate the tesseract binary explicitly so OCR
+        # works regardless of how the process was started.
+        if not shutil.which("tesseract"):
+            for cand in ("/opt/homebrew/bin/tesseract",
+                         "/usr/local/bin/tesseract"):
+                if Path(cand).exists():
+                    pytesseract.pytesseract.tesseract_cmd = cand
+                    break
         with Image.open(path) as im:
             ocr_text = pytesseract.image_to_string(im).strip()
     except ImportError:
