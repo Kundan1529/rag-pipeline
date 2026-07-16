@@ -2492,12 +2492,21 @@ class AgentSystem:
         if not needs_repair:
             return answer, validation
 
+        # Repair is a SELF-CONTAINED task: deliberately no conversation
+        # history. With history included, the repair model latched onto the
+        # previous turn and regenerated the previous question's answer
+        # (caught by the coverage guard, but never feed the trap).
         repaired, provider = self._repair_answer(
-            query, answer, findings, validation, history,
+            query, answer, findings, validation, history=None,
         )
         if not repaired:
             validation["llm_repair"] = "attempted — no repair output"
             return answer, validation
+
+        # Small models echo the repair-task banner back into their output;
+        # strip any preamble before the first markdown heading so instruction
+        # text can never leak into an accepted answer.
+        repaired = self._strip_repair_echo(repaired)
 
         repaired, revalidation = self.validator.validate_and_repair(
             answer=repaired,
@@ -2520,6 +2529,22 @@ class AgentSystem:
             f"on {old_cov:.2f}; original answer kept"
         )
         return answer, validation
+
+    @staticmethod
+    def _strip_repair_echo(text: str) -> str:
+        """Drop an echoed instruction preamble ('ANSWER REPAIR TASK' banner,
+        'The previous draft failed evidence validation', bare ===== rules)
+        that small models copy from the repair prompt. The real answer
+        starts at the first markdown heading."""
+        m = re.search(r"^#{1,3}\s", text, re.MULTILINE)
+        if m and m.start() > 0:
+            head = text[: m.start()]
+            if re.search(
+                r"ANSWER REPAIR TASK|previous draft failed|^\s*={4,}\s*$",
+                head, re.IGNORECASE | re.MULTILINE,
+            ):
+                return text[m.start():].strip()
+        return text.strip()
 
     def _repair_answer(
     self,

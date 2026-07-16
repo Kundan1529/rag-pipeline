@@ -91,6 +91,7 @@ class QueryProcessor:
         # (e.g. "LangChain", "LangGraph").
         "key","difference","differences","between","compare","comparison",
         "versus","vs","define","definition","meaning","overview","summary",
+        "different","differs","differ","from","than","unlike",
         # "explain X in detail(s)" scaffolding — not entities
         "detail","details","depth","detailed",
     }
@@ -267,6 +268,11 @@ class QueryProcessor:
             r"\bcompare\s+(.+?)\s+(?:with|and|to)\s+(.+?)(?:\?|$)",
             r"^(.+?)\s+(?:vs\.?|versus)\s+(.+?)(?:\?|$)",
             r"\bdifference\s+(?:between\s+)?(.+?)\s+and\s+(.+?)(?:\?|$)",
+            # "how is X different from Y" / "X differs from Y" — this form
+            # previously matched nothing, so comparison queries phrased with
+            # "different from" got no aspect-aware retrieval at all.
+            r"\bhow\s+(?:is|are|do|does)\s+(.+?)\s+differ(?:ent)?\s+from\s+(.+?)(?:\?|$)",
+            r"\b(\S+(?:\s+\S+)?)\s+(?:is|are)?\s*differ(?:s|ent)?\s+from\s+(.+?)(?:\?|$)",
         ]
 
         for pattern in patterns:

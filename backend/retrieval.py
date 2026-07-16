@@ -438,14 +438,26 @@ class HybridIndex:
 
     @staticmethod
     def prose_factor(text: str) -> float:
-        """How much of this chunk is actual prose vs outline/TOC scaffolding.
-        1.0 = full sentences; ~0 = a contents page. Dotted-leader lines
-        ('… 111') are a dead giveaway and force the factor to 0."""
+        """How much of this chunk is actual prose vs scaffolding/boilerplate.
+        1.0 = full sentences; ~0 = a contents page, a references list, or a
+        paper title page. Dead giveaways, each forcing the factor to 0:
+        dotted-leader TOC lines ('… 111'), bibliography entries ('[23] A.
+        Author…'), and author/affiliation blocks (dense email lines) — words-
+        per-line alone reads all three as prose, which let a title page and
+        a references chunk outrank real content once the cross-encoder
+        collapsed."""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         if not lines:
             return 0.0
         toc_lines = sum(1 for l in lines if re.search(r"\.{3,}\s*\d+\s*$", l))
         if toc_lines / len(lines) > 0.3:
+            return 0.0
+        ref_lines = sum(1 for l in lines if re.match(r"\[\d+\]\s", l))
+        if ref_lines / len(lines) > 0.25:
+            return 0.0
+        email_lines = sum(
+            1 for l in lines if re.search(r"\S+@\S+\.\S+", l))
+        if email_lines / len(lines) > 0.15:
             return 0.0
         return sum(1 for l in lines if len(l.split()) >= 8) / len(lines)
 
@@ -1069,24 +1081,35 @@ class HybridIndex:
                 + w["metadata"] * meta_n
                 + w["entity"] * entity_n)
 
-    def _gate_weights(self, ranked, reranker_scores) -> tuple[dict, bool]:
-        """Acceptance weights for this candidate set. When the cross-encoder
-        has collapsed (best candidate below CE_COLLAPSE_FLOOR — out-of-domain
-        text such as dense academic prose), its weight is redistributed
-        proportionally over the remaining signals so the gate judges on
-        dense/BM25/entity evidence instead of rejecting everything."""
-        best_ce = max(
-            (reranker_scores.get(idx, 0.0) for idx, _, _ in ranked),
-            default=0.0,
+    def _apply_ce_collapse_fallback(
+        self,
+        query: str,
+        reranked: list[tuple[int, float, float]],
+        reranker_scores: dict[int, float],
+    ) -> tuple[list[tuple[int, float, float]], dict[int, float], bool]:
+        """Stage 5b: reranker-collapse fallback. When even the best candidate
+        scores below CE_COLLAPSE_FLOOR the CE is out-of-domain for this
+        query/corpus — SUBSTITUTE the content-grounded lexical-support signal
+        (idf-weighted coverage × prose factor) for the collapsed CE, in both
+        ranking and the acceptance gate. Substitution beats weight
+        redistribution: redistribution let a paper's TITLE PAGE (authors,
+        emails, copyright) through purely on entity coverage, while the prose
+        factor inside lexical support correctly starves boilerplate."""
+        best_ce = max(reranker_scores.values(), default=0.0)
+        if not reranker_scores or best_ce >= self.CE_COLLAPSE_FLOOR:
+            return reranked, reranker_scores, False
+        print("⚠️ Reranker collapse: best cross-encoder score "
+              f"{best_ce:.2f} < {self.CE_COLLAPSE_FLOOR} — substituting "
+              "lexical-support (coverage × prose) for ranking and gating")
+        lex = {
+            idx: self._lexical_support(query, self.chunks[idx].text)
+            for idx, _, _ in reranked
+        }
+        substituted = sorted(
+            ((idx, lex[idx], boost) for idx, _, boost in reranked),
+            key=lambda item: -item[1],
         )
-        if best_ce >= self.CE_COLLAPSE_FLOOR or not reranker_scores:
-            return self.ACCEPTANCE_WEIGHTS, False
-        base = {k: v for k, v in self.ACCEPTANCE_WEIGHTS.items()
-                if k != "reranker"}
-        total = sum(base.values()) or 1.0
-        weights = {k: v / total for k, v in base.items()}
-        weights["reranker"] = 0.0
-        return weights, True
+        return substituted, lex, True
 
     def _evidence_acceptance_gate(
         self,
@@ -1106,22 +1129,18 @@ class HybridIndex:
         acceptance: dict[int, dict] = {}
         thr = self.ACCEPTANCE_THRESHOLD
         reranker_scores = reranker_scores or {}
-        weights, ce_collapsed = self._gate_weights(ranked, reranker_scores)
-        if ce_collapsed:
-            print("⚠️ Reranker collapse: best cross-encoder score below "
-                  f"{self.CE_COLLAPSE_FLOOR} — gating on dense/BM25/entity "
-                  "signals for this query")
         for rank, candidate in enumerate(ranked):
             idx, score, metadata_boost = candidate
             # Use the PURE cross-encoder relevance for the gate's "reranker"
-            # component. After entity-aware fusion the candidate's score
-            # already blends entity coverage and metadata — feeding that in
-            # here would count both signals twice.
+            # component (or the lexical-support substitute when the CE has
+            # collapsed — stage 5b already swapped reranker_scores). After
+            # entity-aware fusion the candidate's score already blends entity
+            # coverage and metadata — feeding that in here would count both
+            # signals twice.
             ce_score = reranker_scores.get(idx, score)
             a = self._acceptance_score(
                 idx, ce_score, metadata_boost,
                 dense_scores, bm25_scores, graph_scores, graph_entities,
-                weights=weights,
             )
             if rank == 0:
                 reason = "top-ranked anchor evidence"
@@ -1340,6 +1359,11 @@ class HybridIndex:
         pool_size = self._candidate_pool_size(query, k)
         reranked, reranker_scores = self._semantic_rerank(
             query, boosted, top_n=pool_size,
+        )
+
+        # ---- Stage 5b: reranker-collapse fallback --------------------------
+        reranked, reranker_scores, _ce_collapsed = (
+            self._apply_ce_collapse_fallback(query, reranked, reranker_scores)
         )
 
         # ---- Stage 6: entity-aware score fusion ---------------------------

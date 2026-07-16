@@ -816,6 +816,13 @@ def synthesize(
             .strip()
         )
 
+        # Models sometimes echo a prompt banner ("==== ANSWER ====") before
+        # the real content — strip any leading banner blocks.
+        response = re.sub(
+            r"^(?:\s*={4,}\s*\n(?:[^\n]{0,80}\n)?(?:={4,}\s*\n)?)+\s*",
+            "", response,
+        )
+
         while "\n\n\n" in response:
             response = response.replace("\n\n\n", "\n\n")
 
