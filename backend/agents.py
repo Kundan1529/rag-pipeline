@@ -409,6 +409,22 @@ class AgentSystem:
                 for sd in nd.get("source_docs", [nd.get("source_doc")]):
                     if sd:
                         targets.add(sd)
+        if targets:
+            # Concept routing is a heuristic, and a single generic token can
+            # hijack it: the Attention paper's 'GPUs' concept routed
+            # 'tell me about the gpu-graph accelerator' — a RESUME project —
+            # to the paper, locking retrieval onto the wrong document while
+            # BM25 scored the resume chunk at double the runner-up. Sanity
+            # check: if NONE of the query's top confident lexical hits fall
+            # inside the concept-routed documents, the corpus disagrees with
+            # the concept association — drop it and let the dominant-
+            # document vote decide from actual retrieval.
+            hits = self.index._bm25(query)[:5]
+            if hits and hits[0][1] >= 4.0:
+                inside = sum(1 for i, _ in hits
+                             if self.index.chunks[i].doc_no in targets)
+                if inside == 0:
+                    return set()
         return targets
 
     @staticmethod
@@ -1388,6 +1404,25 @@ class AgentSystem:
                     confidence=sp.confidence,
                     corrected_query=query,
                 )
+        # Style requests ("give answers in points", "as a table") are
+        # PROMPT instructions, not search terms. Detect them, then strip
+        # them from the retrieval path — left in, 'points' became an entity
+        # and steered retrieval toward the paper's 'point-wise' chunks.
+        style_directives = llm.detect_style_directives(query)
+        if style_directives:
+            stripped = llm.strip_style_phrases(query)
+            if stripped != query:
+                print(f"Style request separated ({len(style_directives)} "
+                      f"directive(s)); retrieval query: {stripped!r}")
+                trace.add(
+                    stage="style",
+                    title="Response Style",
+                    summary=f"{len(style_directives)} style directive(s) "
+                            "routed to the prompt",
+                    directives=style_directives,
+                    retrieval_query=stripped,
+                )
+                query = stripped
         query_plan = self.query_processor.process(query)
         print("\n=== QUERY PLAN ===")
         print("Original query:", query_plan.original_query)
@@ -1610,6 +1645,7 @@ class AgentSystem:
                 # to THIS query (recall) + the recent turns verbatim. This is
                 # what lets a long chat connect back to earlier discussion.
                 convmem.curate(query, history),
+                style_directives=style_directives,
             )
 
             # =========================================================
@@ -1675,6 +1711,39 @@ class AgentSystem:
                 )
                 if validation.get("llm_repair"):
                     print(f"\n🔁 LLM self-correction: {validation['llm_repair']}")
+
+            # =========================================================
+            # STEP 2c — Confidence floor. When even after citation repair
+            # and self-correction the answer's claims are predominantly
+            # ungrounded, DO NOT release it with a warning banner: replace
+            # it with an honest insufficient-evidence response. Measured
+            # failure: 'tell me about the gpu-graph accelerator' produced
+            # a fully fabricated hardware-accelerator definition (coverage
+            # 0.10, every claim INSUFFICIENT) that shipped as RELEASE.
+            # =========================================================
+
+            COVERAGE_FLOOR = 0.35
+            if (not validation.get("valid")
+                    and validation.get("coverage", 1.0) < COVERAGE_FLOOR
+                    and validation.get("insufficient_evidence_claims", 0)
+                        > validation.get("supported_claims", 0)):
+                docs = sorted({e.get("doc_no", "?") for e in evidence})[:3]
+                answer = (
+                    "## Insufficient Evidence\n\n"
+                    "The retrieved documents do not contain enough grounded "
+                    "information to answer this question reliably, so no "
+                    "speculative answer is being generated.\n\n"
+                    + (f"Closest material found: {', '.join(docs)}.\n\n"
+                       if docs else "")
+                    + "Try rephrasing the question, or name the document "
+                      "you mean (e.g. \"in the person_resume, ...\").")
+                answer_source = "confidence-floor"
+                validation["confidence_floor"] = (
+                    f"answer suppressed — coverage "
+                    f"{validation.get('coverage', 0.0):.2f} < {COVERAGE_FLOOR} "
+                    f"with {validation.get('insufficient_evidence_claims', 0)} "
+                    "ungrounded claim(s)")
+                print(f"⛔ Confidence floor: {validation['confidence_floor']}")
 
             if not validation["valid"]:
                 print(
@@ -2848,6 +2917,7 @@ class AgentSystem:
     anchor: str | None,
     findings: dict,
     history: list | None = None,
+    style_directives: list[str] | None = None,
 ) -> tuple[str, str]:
 
         case_file = self._case_file_text(
@@ -2978,6 +3048,7 @@ class AgentSystem:
             question_type=getattr(
                 findings.get("query_plan"), "intent", None,
             ),
+            style_directives=style_directives,
         )
 
         if answer:

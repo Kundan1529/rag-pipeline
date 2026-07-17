@@ -380,6 +380,29 @@ def detect_style_directives(query: str) -> list[str]:
             if re.search(pattern, query, re.IGNORECASE)]
 
 
+# Optional lead-in before a style phrase ("give answers in points",
+# "keep it short", "please answer as a table").
+_STYLE_LEADIN = (r"[.,;]?\s*(?:please\s+)?(?:(?:give|answer|respond|reply|"
+                 r"explain|present|show|keep|make|write)\s+(?:me\s+)?"
+                 r"(?:the\s+)?(?:answers?|it|this|them)?\s*)?")
+
+
+def strip_style_phrases(query: str) -> str:
+    """Remove style requests from the query text so they never reach
+    retrieval. 'tell me about the gpu-graph accelerator in points' left
+    'points' in the retrieval query and entity list, steering retrieval
+    toward the paper's 'point-wise' chunks; the style request belongs to
+    the PROMPT (detect_style_directives), not to search."""
+    if not query or len(query) > 300:
+        return query
+    out = query
+    for pattern, _ in _STYLE_RULES:
+        out = re.sub(_STYLE_LEADIN + r"(?:in|as|with)?\s*" + pattern,
+                     " ", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s{2,}", " ", out).strip(" .,;")
+    return out if len(out.split()) >= 2 else query
+
+
 def _user_message(
     query: str,
     case_file: str,
@@ -745,6 +768,7 @@ def synthesize(
     history: list | None = None,
     *,
     question_type: str | None = None,
+    style_directives: list[str] | None = None,
 ) -> str | None:
     """
     Generate an answer from the supplied CASE FILE.
@@ -821,7 +845,8 @@ def synthesize(
             query=query,
             case_file=case_file,
             question_type=question_type,
-            style_directives=detect_style_directives(query),
+            style_directives=(style_directives if style_directives is not None
+                              else detect_style_directives(query)),
         )
     )
     print("=" * 80)

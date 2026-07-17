@@ -94,6 +94,8 @@ class QueryProcessor:
         "different","differs","differ","from","than","unlike",
         # "explain X in detail(s)" scaffolding — not entities
         "detail","details","depth","detailed",
+        # answer-request scaffolding ("give answers in points")
+        "give","answer","answers",
     }
     INTENT_RULES = {
 
@@ -624,6 +626,12 @@ class QueryProcessor:
         tokens = re.findall(r"[A-Za-z0-9_.+-]+", query)
 
         for token in tokens:
+
+            # Sentence punctuation is not part of a name: "attention." from
+            # "what is multi-head attention. give answers..." failed every
+            # entity match because of the trailing dot. Interior dots
+            # (app.py, node.js) are preserved.
+            token = token.strip(".,")
 
             if len(token) < 3:
                 continue
