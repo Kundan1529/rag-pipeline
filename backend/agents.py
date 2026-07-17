@@ -1575,6 +1575,7 @@ class AgentSystem:
             self.context.update(
                 evidence=evidence,
                 intent=query_plan.intent,
+                query=original_query,
             )
         focus = self._retrieval_focus
         diag = self._retrieval_diagnostics

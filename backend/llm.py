@@ -409,8 +409,12 @@ def strip_style_phrases(query: str) -> str:
     for pattern, _ in _STYLE_RULES:
         out = re.sub(_STYLE_LEADIN + r"(?:in|as|with)?\s*" + pattern,
                      " ", out, flags=re.IGNORECASE)
-    out = re.sub(r"\s{2,}", " ", out).strip(" .,;")
-    return out if len(out.split()) >= 2 else query
+    out = re.sub(r"\s{2,}", " ", out).strip(" .,;?")
+    # A single surviving word is a perfectly good retrieval query
+    # ("explain attention in simple words" -> "attention"); only fall back
+    # to the raw text when stripping leaves NOTHING, which means the whole
+    # query was a style request with no subject of its own.
+    return out if out.split() else query
 
 
 def _user_message(
