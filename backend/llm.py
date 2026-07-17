@@ -342,19 +342,67 @@ Before returning the answer, ensure that:
 - and no citation or factual detail has been invented.
 """
 
+# M02: response-style detection. Users say HOW they want the answer
+# ("in simple words", "as a table", "short", "in bullet points") and the
+# fixed template ignored them. Detected directives are injected into the
+# prompt; everything else (grounding, citations) is unchanged.
+_STYLE_RULES: list[tuple[str, str]] = [
+    (r"\b(?:simple (?:words|terms|language)|in simple|eli5|"
+     r"like i'?m (?:5|five|a beginner)|layman'?s|non[- ]technical|beginner)\b",
+     "Use plain, simple language a beginner can follow; avoid jargon, and "
+     "briefly explain any technical term you must use."),
+    (r"\b(?:bullet points?|as bullets|bulleted|point[- ]wise)\b",
+     "Format the core answer as concise bullet points rather than "
+     "paragraphs."),
+    (r"\b(?:as a table|in a table|tabular|comparison table|table format)\b",
+     "Present the key content as a Markdown table."),
+    (r"\b(?:short|brief|briefly|concise|quick|tl;?dr|in (?:one|a) "
+     r"(?:line|sentence|paragraph)|one[- ]liner)\b",
+     "Keep the whole answer short: Executive Summary and Direct Answer "
+     "only, under roughly 120 words total."),
+    (r"\b(?:detailed|in[- ]depth|comprehensive|thorough|elaborate|"
+     r"step[- ]by[- ]step)\b",
+     "Give a thorough, step-by-step treatment with full detail."),
+    (r"\b(?:page[- ]wise|page by page|per page)\b",
+     "Organize the answer page by page, labelling each page's section."),
+]
+
+
+def detect_style_directives(query: str) -> list[str]:
+    """User-requested response-style directives found in the query.
+    Long inputs (repair instructions, pasted text) are never scanned —
+    style words inside them are not requests."""
+    if not query or len(query) > 300:
+        return []
+    return [directive for pattern, directive in _STYLE_RULES
+            if re.search(pattern, query, re.IGNORECASE)]
+
+
 def _user_message(
     query: str,
     case_file: str,
     *,
     question_type: str | None = None,
+    style_directives: list[str] | None = None,
 ) -> str:
     # Only state the question type when the pipeline actually detected one.
     # The old hardcoded defaults ("Question Type: Unknown", "Document Scope:
     # Current uploaded document") injected wrong metadata into every prompt
     # and contradicted the case file's own Intent line.
     qtype_line = f"\nQuestion Type: {question_type}" if question_type else ""
+    style_block = ""
+    if style_directives:
+        rules = "\n".join(f"- {d}" for d in style_directives)
+        style_block = (
+            "\n========================================================\n"
+            "USER-REQUESTED RESPONSE STYLE (takes precedence over the\n"
+            "default answer format below, but never over grounding and\n"
+            "citation rules)\n"
+            "========================================================\n"
+            f"{rules}\n"
+        )
 
-    return f"""
+    return f"""{style_block}
 ========================================================
 TASK
 ========================================================
@@ -771,6 +819,7 @@ def synthesize(
             query=query,
             case_file=case_file,
             question_type=question_type,
+            style_directives=detect_style_directives(query),
         )
     )
     print("=" * 80)

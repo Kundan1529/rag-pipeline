@@ -8,6 +8,7 @@ score and gates the release.
 """
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 
@@ -617,6 +618,104 @@ class AgentSystem:
         return {"retrieved": len(items), "used": used_n,
                 "rejected": len(items) - used_n, "items": items}
 
+    # ---------------------------------------------------------------- M03
+    # Whole-document / page-wise requests ("summarize the entire paper",
+    # "explain page 5") are DOCUMENT requests, not search queries: top-k
+    # retrieval structurally cannot answer them, whatever k is. They get a
+    # direct document-map evidence path instead.
+
+    _DOC_REQ_VERB = re.compile(
+        r"\b(?:summari[sz]e|summary|explain|describe|overview|walk\s*through|"
+        r"walkthrough|go\s+through|review)\b", re.IGNORECASE)
+    _DOC_REQ_WHOLE = re.compile(
+        r"\b(?:whole|entire|complete|full|every\s+page|all\s+pages|"
+        r"page\s*(?:-|\s)?by\s*(?:-|\s)?page|page[- ]wise|start\s+to\s+"
+        r"(?:finish|end))\b", re.IGNORECASE)
+    _DOC_REQ_PAGE = re.compile(r"\bpage\s+(\d{1,4})\b", re.IGNORECASE)
+    _DOC_WORDS = {"document", "doc", "pdf", "paper", "resume", "book",
+                  "manual", "file", "report", "contents", "image", "it"}
+
+    def _doc_request(self, query: str) -> dict | None:
+        """Classify a query as a document-level request, or None."""
+        m = self._DOC_REQ_PAGE.search(query)
+        if m and self._DOC_REQ_VERB.search(query):
+            return {"mode": "page", "page": int(m.group(1))}
+        if not self._DOC_REQ_VERB.search(query):
+            return None
+        if self._DOC_REQ_WHOLE.search(query):
+            return {"mode": "whole"}
+        # bare "summarize the <doc>": after removing the verb and generic
+        # document words, nothing content-bearing remains — the request is
+        # about the document itself, not a topic inside it.
+        toks = [t for t in re.findall(r"[a-z0-9][a-z0-9_.-]+", query.lower())
+                if t not in convmem._STOP]
+        leftovers = [t for t in toks
+                     if not self._DOC_REQ_VERB.fullmatch(t)
+                     and t not in self._DOC_WORDS
+                     and t not in {"summarize", "summarise", "summary",
+                                   "overview", "walkthrough"}]
+        content = [t for t in leftovers
+                   if t not in {d.lower() for d in self.corpus.docs}
+                   and not any(t in d.lower() or t in
+                               str(m.get("title", "")).lower()
+                               for d, m in self.corpus.docs.items())]
+        if not content:
+            return {"mode": "whole"}
+        return None
+
+    # Above this many chunks, whole-document evidence uses the document MAP
+    # (per-chunk ingest summaries bucketed into ranges) instead of full text.
+    DOC_MODE_FULL_TEXT_LIMIT = 12
+    DOC_MODE_BUCKETS = 15
+
+    def _document_mode_evidence(self, doc_no: str, req: dict) -> list[dict]:
+        idxs = self.index._doc_positions.get(doc_no, [])
+        chunks = [self.index.chunks[i] for i in idxs]
+        if not chunks:
+            return []
+
+        def item(cid, section, text, page):
+            return {
+                "chunk_id": cid, "doc_no": doc_no,
+                "doc_title": chunks[0].doc_title,
+                "revision": chunks[0].revision, "section": section,
+                "text": text, "summary": "", "keywords": [], "concepts": [],
+                "entities": [], "page": page, "score": 1.0,
+                "dense_score": 0.0, "bm25_score": 0.0, "graph_score": 0,
+                "rrf_score": 0.0, "reranker_score": 1.0, "entity_score": 0.0,
+                "matched_entities": [],
+                "retrieval_method": "document-mode",
+                "retrieval_reason": f"document-level request ({req['mode']})",
+                "selected_because": f"document {req['mode']} request — "
+                                    "bypasses top-k retrieval",
+                "accepted": True, "acceptance_score": 1.0,
+            }
+
+        if req["mode"] == "page":
+            sel = [c for c in chunks if c.page == req["page"]][:8]
+            return [item(c.chunk_id, c.section, c.text, c.page) for c in sel]
+
+        if len(chunks) <= self.DOC_MODE_FULL_TEXT_LIMIT:
+            return [item(c.chunk_id, c.section, c.text, c.page)
+                    for c in chunks]
+
+        # Large document: hierarchical map from the per-chunk summaries the
+        # ingest pipeline already computed — full structural coverage at a
+        # fraction of the tokens, no extra LLM cost.
+        size = max(1, math.ceil(len(chunks) / self.DOC_MODE_BUCKETS))
+        out = []
+        for start in range(0, len(chunks), size):
+            group = chunks[start:start + size]
+            pages = sorted({c.page for c in group})
+            label = (f"Pages {pages[0]}–{pages[-1]}"
+                     if pages[-1] != pages[0] else f"Page {pages[0]}")
+            digest = "\n".join(
+                f"- ({c.section}) {c.summary or c.text[:120]}"
+                for c in group)[:1500]
+            out.append(item(f"{doc_no}::map{start}", label,
+                            f"{label} overview:\n{digest}", pages[0]))
+        return out
+
     def _knowledge_agent(
     self,
     query: str,
@@ -635,6 +734,25 @@ class AgentSystem:
         # plan_query = self.query_processor.process(query)
 
         retrieval_queries = query_plan.retrieval_queries
+
+        # M03: document-level requests bypass top-k retrieval entirely.
+        doc_req = self._doc_request(query)
+        if doc_req and target_docs and len(target_docs) == 1:
+            doc = next(iter(target_docs))
+            evidence = self._document_mode_evidence(doc, doc_req)
+            if evidence:
+                self._retrieval_focus = {
+                    "document": doc, "rejected_documents": [],
+                    "routed_by": f"document-{doc_req['mode']} request",
+                }
+                self._retrieval_diagnostics = {
+                    "retrieved": len(evidence), "used": len(evidence),
+                    "rejected": 0, "mode": f"document-{doc_req['mode']}",
+                    "items": [],
+                }
+                print(f"📄 Document-mode evidence: {doc_req['mode']} of "
+                      f"{doc} → {len(evidence)} item(s)")
+                return evidence
 
         if plan["strategy"] == "document":
 

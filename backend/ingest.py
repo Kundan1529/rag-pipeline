@@ -677,9 +677,17 @@ def _ingest_image(path: Path) -> tuple[dict, list[Chunk]]:
             "images.")
     except Exception as exc:
         meta_lines.append(f"OCR failed: {exc}")
-    body = "\n".join(meta_lines)
+    # When OCR succeeded, the chunk text is the DOCUMENT CONTENT ONLY.
+    # Ingestion metadata ("Image file: x.png", "Format: PNG, size: ...",
+    # "Extracted text (OCR):") polluted retrieval and the generator quoted
+    # it as if it were what the document says ("The resume mentions an
+    # image file named person_resume.png..."). The metadata-only body
+    # remains for images with no extractable text — there it IS the only
+    # honest content.
     if ocr_text:
-        body += "\n\nExtracted text (OCR):\n\n" + ocr_text
+        return _pack_text_chunks(_doc_no_for(path), path.name, ocr_text,
+                                 "Uploaded Image")
+    body = "\n".join(meta_lines)
     return _pack_text_chunks(_doc_no_for(path), path.name, body,
                              "Uploaded Image")
 
