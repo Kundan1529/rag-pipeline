@@ -351,9 +351,19 @@ _STYLE_RULES: list[tuple[str, str]] = [
      r"like i'?m (?:5|five|a beginner)|layman'?s|non[- ]technical|beginner)\b",
      "Use plain, simple language a beginner can follow; avoid jargon, and "
      "briefly explain any technical term you must use."),
+    # Counted point requests ("in 3 points", "three points", "3-4 bullets")
+    # are the natural phrasing and were previously invisible: the number
+    # between "in" and "points" broke the plain `in points?` pattern, so the
+    # words survived into retrieval, where "three/point/project" matched
+    # unrelated chapters and OUTSCORED the real document on entity coverage.
+    # The count must be ADJACENT to "points" — "the 3 key points of X" is a
+    # content question, not a formatting request, and must not match.
     (r"\b(?:bullet points?|as bullets|bulleted|point[- ]?wise|"
      r"in points?|as points|in (?:a )?(?:numbered|bulleted) list|"
-     r"numbered (?:list|points)|list (?:it|them) out)\b",
+     r"numbered (?:list|points)|list (?:it|them) out|"
+     r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|"
+     r"a few|couple(?:\s+of)?|several)"
+     r"(?:\s*[-–to]{1,2}\s*\d{1,2})?\s+(?:points?|bullets?))\b",
      "Format the core answer as concise bullet points rather than "
      "paragraphs. Every section's content should be bulleted."),
     (r"\b(?:as a table|in a table|tabular|comparison table|table format)\b",
