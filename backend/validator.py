@@ -139,6 +139,12 @@ class AnswerValidator:
             contra = 0.0
         return (entail, contra)
 
+    _DOC_META_RE = re.compile(
+        r"^(?:the\s+)?\S{0,40}(?:resume|document|paper|pdf|file|manual|"
+        r"sop|report|book)\b.{0,24}?\b(?:mentions?|contains?|includes?|"
+        r"lists?|provides?|describes?|highlights?|shows?)\b",
+        re.IGNORECASE)
+
     _LIST_VERB_RE = re.compile(
         r"\b(?:includes?|including|included|are|is|was|were|has|have|"
         r"provides?|provided|supports?|built|designed|implemented|created|"
@@ -152,6 +158,21 @@ class AnswerValidator:
         comma list or no head verb is found (whole-claim NLI then stands,
         conservatively)."""
         body = re.sub(r"\s*\[\d+\]", "", claim).rstrip(" .")
+        # Explicit list markers bind the head directly: "mentions several
+        # projects, including A, B, and C" must decompose as
+        # "... including A." / "... including B." — the generic comma-split
+        # treated "several projects and roles" as the first item, and its
+        # (correct) failure to be entailed sank the whole true claim.
+        marker = re.search(r"\b(?:including|such as)\b", body, re.IGNORECASE)
+        if marker:
+            head = body[: marker.end()].strip()
+            tail = body[marker.end():].strip()
+            items = [p.strip() for p in
+                     re.split(r",\s*(?:and\s+|or\s+)?|\s+and\s+", tail)
+                     if p.strip()]
+            items = [i for i in items if len(i.split()) >= 2][:4]
+            if len(items) >= 2:
+                return [f"{head} {item}." for item in items]
         parts = [p.strip() for p in
                  re.split(r",\s*(?:and\s+|or\s+)?", body) if p.strip()]
         if len(parts) < 3:                     # head+first item, >=2 more
@@ -392,6 +413,29 @@ class AnswerValidator:
                         r"(?:\s+[\w-]+){0,4}\s+(?:is|are)\s+"
                         r"(?:mentioned|supported|described|documented)\s+"
                         r"(?:in|by)\s+\[\d+\]\s*\.?",
+                        sentence, re.IGNORECASE,
+                    ):
+                        continue
+
+                    # Interpretive commentary is not a factual claim.
+                    # Uncited speculation ("could be a scenario where...",
+                    # "would use their experience to...", "has likely
+                    # honed...") and skill-praise ("these projects showcase
+                    # the individual's skills in...") assert the WRITER'S
+                    # inference, not evidence content — demanding citations
+                    # for them produced five false flags on one resume
+                    # answer. They stay in the answer; they exit strict
+                    # claim-level validation. Cited speculation still gets
+                    # its citation alignment checked.
+                    if (re.search(r"\b(?:would|could|might|likely)\b",
+                                  sentence, re.IGNORECASE)
+                            and not re.search(r"\[\d+\]", sentence)):
+                        continue
+                    if re.search(
+                        r"\b(?:showcas\w*|demonstrat\w*|highlight\w*|"
+                        r"underscor\w*|reflect\w*)\b.{0,60}?"
+                        r"\b(?:skills?|abilit\w+|expertise|experience|"
+                        r"proficienc\w+)\b",
                         sentence, re.IGNORECASE,
                     ):
                         continue
@@ -687,7 +731,17 @@ class AnswerValidator:
         # contradiction (evidence states otherwise) caps the score outright.
         nli_entailment = None
         nli_contradiction = None
-        if self.nli_model is not None and final_score >= 0.45:
+        # Document-containment META-claims ("The person_resume mentions a
+        # SQL analytics project", "The manual lists torque values") cannot
+        # be verified by NLI: no evidence sentence self-references its own
+        # document, so entailment is structurally ~0 even when the claim is
+        # true (measured: 0.002 for a correct containment claim). Whether a
+        # document mentions X IS the lexical/relevance check — those stages'
+        # verdict stands; fabricated containment still fails on low lexical
+        # coverage.
+        is_doc_meta = bool(self._DOC_META_RE.match(clean_claim))
+        if self.nli_model is not None and final_score >= 0.45 \
+                and not is_doc_meta:
             top_texts = [
                 str(item["chunk"].get("text", ""))
                 for item in (synthesis_candidates or [best])[:2]

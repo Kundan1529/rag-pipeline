@@ -531,6 +531,18 @@ class AgentSystem:
             return [], reasons
         top = ranked[0].get("score", 0.0) or 1.0
         single_doc_focus = len({h.get("doc_no") for h in ranked if h.get("doc_no")}) == 1
+        # Document-scoped question on a SMALL document: the user named the
+        # document, so completeness beats precision — every substantive
+        # chunk (the outline hard-filter above already ran) becomes
+        # evidence. Without this, 'tell me the projects in the resume' kept
+        # 3 of 6 resume chunks because the parts listing three of the five
+        # projects never use the word 'project', and the answer omitted
+        # them. Mirrors the same relaxation in the retrieval-level gate.
+        focus_doc = ranked[0].get("doc_no") if single_doc_focus else None
+        small_doc_focus = bool(
+            focus_doc
+            and len(self.index._doc_positions.get(focus_doc, [])) <= 12
+        )
         for rank, h in enumerate(ranked):
             cid = h["chunk_id"]
             if len(used) >= k:
@@ -539,6 +551,9 @@ class AgentSystem:
             if rank == 0:                      # best hit anchors the answer;
                 used.append(h)                 # if even it is weak, the
                 continue                       # grounded-or-refuse gate fires
+            if small_doc_focus:
+                used.append(h)
+                continue
             score = h.get("score", 0.0)
             if score < 0.45 * top:
                 reasons[cid] = f"below relevance bar ({score:.2f} < 45% of top hit)"
