@@ -351,9 +351,11 @@ _STYLE_RULES: list[tuple[str, str]] = [
      r"like i'?m (?:5|five|a beginner)|layman'?s|non[- ]technical|beginner)\b",
      "Use plain, simple language a beginner can follow; avoid jargon, and "
      "briefly explain any technical term you must use."),
-    (r"\b(?:bullet points?|as bullets|bulleted|point[- ]wise)\b",
+    (r"\b(?:bullet points?|as bullets|bulleted|point[- ]?wise|"
+     r"in points?|as points|in (?:a )?(?:numbered|bulleted) list|"
+     r"numbered (?:list|points)|list (?:it|them) out)\b",
      "Format the core answer as concise bullet points rather than "
-     "paragraphs."),
+     "paragraphs. Every section's content should be bulleted."),
     (r"\b(?:as a table|in a table|tabular|comparison table|table format)\b",
      "Present the key content as a Markdown table."),
     (r"\b(?:short|brief|briefly|concise|quick|tl;?dr|in (?:one|a) "
