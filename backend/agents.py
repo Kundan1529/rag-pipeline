@@ -276,7 +276,12 @@ class AgentSystem:
     # A BM25 hit at/above this score is a confident lexical match; below it
     # the query is too vague to overturn conversation-based routing.
     FOLLOWUP_SHIFT_MIN_SCORE = 4.0
-    FOLLOWUP_SHIFT_TOP_K = 5
+    # The best inherited-doc hit must fall below this fraction of the
+    # query's best hit for the topic to count as changed. Measured shift
+    # cases sit near 0.61-0.62 ("what are transformers" 4.74/7.83;
+    # "HashRing KV" 7.3/11.8); a genuine follow-up scores 1.0 because its
+    # top hit IS inside the inherited docs.
+    FOLLOWUP_SHIFT_MARGIN = 0.8
 
     def _followup_topic_shift(self, query: str,
                               inherited_docs: set[str]) -> bool:
@@ -299,14 +304,30 @@ class AgentSystem:
         vague one ('explain more') keeps it via the score floor."""
         if not inherited_docs:
             return False
-        hits = self.index._bm25(query)[: self.FOLLOWUP_SHIFT_TOP_K]
+        hits = self.index._bm25(query)
         if not hits or hits[0][1] < self.FOLLOWUP_SHIFT_MIN_SCORE:
             return False                      # vague query — trust context
-        inside = sum(
-            1 for i, _ in hits
-            if self.index.chunks[i].doc_no in inherited_docs
+        best_score = hits[0][1]
+        top_doc = self.index.chunks[hits[0][0]].doc_no
+        best_inside = max(
+            (s for i, s in hits
+             if self.index.chunks[i].doc_no in inherited_docs),
+            default=0.0,
         )
-        return inside == 0
+        # The query's OWN best evidence decides. A shift means: the single
+        # strongest hit lies outside the inherited documents AND clearly
+        # beats anything inside them.
+        #
+        # The previous rule — "no inherited-doc hit anywhere in the top-5" —
+        # could essentially never fire: this corpus is ~90% LangChain, so
+        # almost every query has LangChain chunks near the top. Measured on
+        # "explain about the project HashRing KV" after a LangChain turn:
+        # the resume led at 11.8 with four LangChain chunks behind it, so
+        # `inside == 0` was False, the LangChain docs were inherited, and
+        # the resume — the only document that mentions HashRing — was
+        # excluded from retrieval entirely.
+        return (top_doc not in inherited_docs
+                and best_inside < self.FOLLOWUP_SHIFT_MARGIN * best_score)
 
     def _graph_reasoning(self, query: str, entities: list[str]) -> dict:
         """Graph-first step: detect which graph entities/concepts the query names,
