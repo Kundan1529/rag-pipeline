@@ -373,11 +373,97 @@ _STYLE_RULES: list[tuple[str, str]] = [
      "Keep the whole answer short: Executive Summary and Direct Answer "
      "only, under roughly 120 words total."),
     (r"\b(?:detailed|in[- ]depth|comprehensive|thorough|elaborate|"
-     r"step[- ]by[- ]step)\b",
+     r"step[- ]by[- ]step|(?:in|with|more)\s+(?:more\s+)?detail(?:s)?|"
+     r"in\s+full)\b",
      "Give a thorough, step-by-step treatment with full detail."),
     (r"\b(?:page[- ]wise|page by page|per page)\b",
      "Organize the answer page by page, labelling each page's section."),
 ]
+
+
+# ------------------------------------------------------- answer structure
+# The answer's SECTIONS are chosen per query. Previously the prompt said
+# "use only the sections that improve the answer" and then spelled out all
+# eight — so an 8B model produced Executive Summary + Direct Answer +
+# Detailed Explanation + Real-World Example + Limitations for "what is
+# LCEL?", every time. Describing flexibility does not create it; the
+# template has to actually change.
+_SECTIONS = {
+    "Executive Summary":
+        "## Executive Summary\n\n2-3 sentences capturing the essential "
+        "answer, readable on its own.",
+    "Direct Answer":
+        "## Direct Answer\n\nAnswer the user's actual question immediately "
+        "and concretely, with inline evidence citations.",
+    "Comparison":
+        "## Comparison\n\nA Markdown table with one row per aspect and one "
+        "column per item being compared, then 2-3 sentences on the "
+        "difference that actually matters. Cite each row.",
+    "Steps":
+        "## Steps\n\nThe procedure as a numbered list, in order, one action "
+        "per step, each cited. Include prerequisites and safety "
+        "requirements as the first steps when the evidence states them.",
+    "Detailed Explanation":
+        "## Detailed Explanation\n\nSynthesize the relevant evidence around "
+        "the user's question — not around the order chunks were retrieved. "
+        "Never one paragraph per chunk; never restate a point already made.",
+    "Limitations":
+        "## Limitations\n\nONLY if the evidence leaves a meaningful part of "
+        "the question unresolved or conflicting. State it once. Omit this "
+        "section entirely when the evidence answers the question.",
+    "General Knowledge (Not from Retrieved Documents)":
+        "## General Knowledge (Not from Retrieved Documents)\n\nONLY when "
+        "retrieved evidence is insufficient and background would materially "
+        "help. Never use CASE FILE citations here. Omit when unnecessary.",
+    "Sources":
+        "## Sources\n\nOnly the sources actually used, exactly as named in "
+        "the CASE FILE. Never invent document names, pages or revisions.",
+    "Suggested Follow-up Questions":
+        "## Suggested Follow-up Questions\n\n2-3 short, genuinely useful "
+        "next questions, each on its own line prefixed with \"- \".",
+}
+
+# intent -> sections. Keys match QueryProcessor.detect_intent's labels.
+_FORMAT_BY_INTENT: dict[str, list[str]] = {
+    "definition": ["Direct Answer", "Detailed Explanation", "Sources"],
+    "comparison": ["Executive Summary", "Comparison", "Sources"],
+    "procedure": ["Steps", "Sources"],
+    "implementation": ["Direct Answer", "Detailed Explanation", "Sources"],
+    "methodology": ["Direct Answer", "Detailed Explanation", "Sources"],
+    "reasoning": ["Executive Summary", "Detailed Explanation", "Sources"],
+    "results": ["Direct Answer", "Detailed Explanation", "Sources"],
+    "citation": ["Direct Answer", "Sources"],
+    "author": ["Direct Answer", "Sources"],
+    "figure": ["Direct Answer", "Sources"],
+    "equation": ["Direct Answer", "Detailed Explanation", "Sources"],
+    "conclusion": ["Executive Summary", "Direct Answer", "Sources"],
+    "summary": ["Executive Summary", "Detailed Explanation", "Sources"],
+    "limitations": ["Direct Answer", "Limitations", "Sources"],
+}
+_FORMAT_DEFAULT = ["Executive Summary", "Direct Answer",
+                   "Detailed Explanation", "Sources"]
+
+
+def answer_sections(question_type: str | None,
+                    style_directives: list[str] | None = None) -> list[str]:
+    """The sections this answer should actually have."""
+    style = " ".join(style_directives or []).lower()
+    if "under roughly 120 words" in style:          # "keep it short"
+        return ["Direct Answer", "Sources"]
+    sections = list(_FORMAT_BY_INTENT.get(
+        (question_type or "").lower(), _FORMAT_DEFAULT))
+    if "markdown table" in style and "Comparison" not in sections:
+        sections.insert(max(0, len(sections) - 1), "Comparison")
+    if "thorough, step-by-step" in style:
+        for extra in ("Executive Summary", "Detailed Explanation"):
+            if extra not in sections:
+                sections.insert(len(sections) - 1, extra)
+    # Follow-ups close every answer; Sources is always last and appears
+    # once. (Every intent list already ends in Sources, so re-order rather
+    # than duplicate.)
+    sections = [s for s in sections if s != "Sources"]
+    sections += ["Sources", "Suggested Follow-up Questions"]
+    return sections
 
 
 def detect_style_directives(query: str) -> list[str]:
@@ -429,6 +515,11 @@ def _user_message(
     # Current uploaded document") injected wrong metadata into every prompt
     # and contradicted the case file's own Intent line.
     qtype_line = f"\nQuestion Type: {question_type}" if question_type else ""
+    # Sections are chosen for THIS question rather than described as
+    # optional in a fixed eight-section template the model then copies.
+    answer_format = "\n\n".join(
+        _SECTIONS[name] for name in
+        answer_sections(question_type, style_directives) if name in _SECTIONS)
     style_block = ""
     if style_directives:
         rules = "\n".join(f"- {d}" for d in style_directives)
@@ -516,76 +607,27 @@ CASE FILE
 ANSWER FORMAT
 ========================================================
 
-Use only the sections that improve the answer. Short factual questions may
-need only the Executive Summary and Direct Answer. Prefer bullet points and
-Markdown tables over dense paragraphs whenever they make the answer clearer
-(comparisons, lists of steps, parameter values).
+Use EXACTLY the sections listed below, in this order, and no others. They
+were chosen for THIS question — do not add sections that are not listed.
+
+{answer_format}
+
+Two sections may be added ONLY if genuinely warranted:
+- "## Limitations" — when the evidence leaves a meaningful part of the
+  question unresolved or conflicting. State it once, after the answer.
+- "## General Knowledge (Not from Retrieved Documents)" — when retrieved
+  evidence is insufficient and background would materially help. Never use
+  CASE FILE citations inside it.
+
+Prefer bullet points and Markdown tables over dense paragraphs wherever
+they make the answer clearer.
 
 CRITICAL OPENING RULE:
-Never begin the response with "the document does not contain",
-"the provided documents do not mention", or any similar disclaimer.
-Always answer the question FIRST using whatever retrieved evidence exists,
-then supplement with clearly separated general knowledge if needed.
-Limitations, if any, come after the answer — never before it.
-
-## Executive Summary
-
-2-3 sentences capturing the essential answer, readable on its own.
-
-## Direct Answer
-
-Answer the user's actual question immediately and concretely.
-
-Include inline evidence citations for factual claims.
-
-## Detailed Explanation
-
-Explain the answer by synthesizing the relevant evidence.
-
-Organize the explanation around the user's question, not around the order in
-which chunks were retrieved. Use bullet points, numbered steps, and tables
-where they improve clarity.
-
-Support important factual claims with the relevant evidence identifiers.
-
-Do not create one paragraph per retrieved chunk. Do not repeat sentences or
-restate the same point in multiple sections.
-
-## Real-World Example
-
-Optional. One brief, concrete example or scenario that makes the answer
-tangible (an operating scenario, a worked application of the concept, or an
-analogous industrial situation). Mark clearly if it comes from general
-knowledge rather than the retrieved documents.
-
-## Evidence from Uploaded Documents
-
-Optional for short answers. Summarize in 2-4 bullets what the retrieved
-documents specifically say that supports the answer, with citations.
-
-## Limitations
-
-Include only when the evidence leaves a meaningful part of the question
-unresolved, ambiguous, or conflicting.
-
-State the exact limitation once.
-
-Do not repeat the same limitation in multiple sections.
-
-## General Knowledge (Not from Retrieved Documents)
-
-Optional.
-
-Include only when retrieved evidence is insufficient and clearly separated
-background knowledge would materially help.
-
-Do not use CASE FILE evidence identifiers in this section.
-
-## Suggested Follow-up Questions
-
-End with 2-3 short, genuinely useful follow-up questions the user could ask
-next, each on its own line prefixed with "- ".
-
+Never begin the response with "the document does not contain", "the
+provided documents do not mention", or any similar disclaimer. Answer the
+question FIRST from the retrieved evidence, then supplement with clearly
+separated general knowledge if needed. Limitations, if any, come after the
+answer — never before it.
 
 CITATION PLACEMENT RULES
 

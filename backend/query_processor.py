@@ -112,6 +112,11 @@ class QueryProcessor:
         "one","two","three","four","five","six","seven","eight","nine","ten",
         "first","second","third","couple","few","several","many",
         "point","points","project","projects","thing","things",
+        # Quantifiers/qualifiers ("explain attention in more details" made
+        # "more" an entity, so every chunk scored coverage 0.5 on a term
+        # that identifies nothing).
+        "more","most","less","much","lot","bit","brief","briefly","simple",
+        "words","short","long","full","complete","whole","entire","again",
     }
     INTENT_RULES = {
 
