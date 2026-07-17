@@ -96,6 +96,22 @@ class QueryProcessor:
         "detail","details","depth","detailed",
         # answer-request scaffolding ("give answers in points")
         "give","answer","answers",
+        # Counts and generic nouns are NEVER entities. They don't merely add
+        # noise — they PENALISE the right chunk, because entity coverage
+        # divides by the entity count: "three key difference between
+        # LangChain and LangGraph" gave a stray LCEL code sample coverage
+        # 1.00 (it contains "three") while the actual LangGraph definition
+        # scored 0.59 and sank to rank 6. Likewise "project" matched
+        # LANGCHAIN_PROJECT=my-project boilerplate and buried the HashRing
+        # chunk. An IDF filter cannot fix this — measured on this corpus,
+        # "project" (4.01) and "three" (3.18) outrank "langgraph" (3.08) and
+        # "lcel" (3.00): the corpus is LangChain-heavy, so the REAL entities
+        # are common and the junk words are rare. These words still take
+        # part in BM25/dense search; they are only barred from the entity
+        # list that drives coverage boosting.
+        "one","two","three","four","five","six","seven","eight","nine","ten",
+        "first","second","third","couple","few","several","many",
+        "point","points","project","projects","thing","things",
     }
     INTENT_RULES = {
 
