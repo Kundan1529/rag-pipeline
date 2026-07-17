@@ -11,6 +11,11 @@ from datetime import datetime
 ALERT_LIMIT = 4.5   # mm/s, ISO 10816 zone B/C
 DANGER_LIMIT = 7.1  # mm/s, ISO 10816 zone C/D
 
+# The asset this sensor stream belongs to. Named here so callers (e.g. the
+# Asset360 endpoint) can tell which asset has live condition data instead
+# of hard-coding the tag in several places.
+ANCHOR_ASSET = "P-101"
+
 
 def analyze(sensors: list[dict]) -> dict:
     vib = [r["vibration_mm_s"] for r in sensors]

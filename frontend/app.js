@@ -993,6 +993,180 @@ window.addEventListener("load", () => {
   Docs.refresh();
   Conv.refresh();
   Graph.load();
+  Asset360.init();
   $("#glayout").value = prefs.layout;
   setInterval(() => Status.refresh(), 30000);
 });
+
+/* --------------------------------------------------------------- Asset360
+   A complete digital profile for one physical asset: live condition and
+   remaining-useful-life prediction, maintenance history, spares, linked
+   documents and P&ID neighbourhood. Every value is rendered from
+   /api/asset/{id} — the backend assembles it from the knowledge graph,
+   maintenance log, spares list and sensor stream. Nothing is generated
+   here; this is a view over the system of record.
+   ------------------------------------------------------------------- */
+const Asset360 = {
+  open: false,
+
+  async init() {
+    $("#tgl-asset").addEventListener("click", () => Asset360.toggle());
+    $("#a3-close").addEventListener("click", () => Asset360.toggle(false));
+    $("#a3-pick").addEventListener("change", (e) => Asset360.load(e.target.value));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && Asset360.open) Asset360.toggle(false);
+    });
+  },
+
+  async toggle(force) {
+    Asset360.open = force === undefined ? !Asset360.open : force;
+    $("#asset360").hidden = !Asset360.open;
+    if (Asset360.open) await Asset360.refreshAssets();
+  },
+
+  async refreshAssets() {
+    try {
+      const r = await fetch(`${API}/api/assets`);
+      const { assets } = await r.json();
+      if (!assets.length) {
+        $("#a3-body").innerHTML =
+          `<div class="a3-empty">No physical assets in the knowledge graph.</div>`;
+        return;
+      }
+      $("#a3-pick").innerHTML = assets.map(a =>
+        `<option value="${esc(a.id)}">${esc(a.id)} — ${esc(a.type)}${
+          a.monitored ? " ●" : ""}</option>`).join("");
+      await Asset360.load(assets[0].id);
+    } catch {
+      $("#a3-body").innerHTML =
+        `<div class="a3-empty">Could not load assets.</div>`;
+    }
+  },
+
+  async load(id) {
+    $("#a3-body").innerHTML = `<div class="a3-empty">Loading ${esc(id)}…</div>`;
+    try {
+      const r = await fetch(`${API}/api/asset/${encodeURIComponent(id)}`);
+      if (!r.ok) throw new Error(String(r.status));
+      Asset360.render(await r.json());
+    } catch {
+      $("#a3-body").innerHTML =
+        `<div class="a3-empty">Could not load ${esc(id)}.</div>`;
+    }
+  },
+
+  /* 14-day vibration trend with alert/danger threshold lines. */
+  sparkline(series, pred) {
+    const vals = series.map(p => p.vibration_mm_s);
+    if (vals.length < 2) return "";
+    const W = 300, H = 64, danger = pred.danger_limit, alert = pred.alert_limit;
+    const lo = Math.min(...vals, 0), hi = Math.max(...vals, danger) * 1.05;
+    const x = i => (i / (vals.length - 1)) * W;
+    const y = v => H - ((v - lo) / (hi - lo)) * H;
+    const path = vals.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+    return `<svg class="a3-spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+      <line x1="0" y1="${y(danger).toFixed(1)}" x2="${W}" y2="${y(danger).toFixed(1)}"
+            stroke="var(--bad)" stroke-width="1" stroke-dasharray="4 3" opacity=".8"/>
+      <line x1="0" y1="${y(alert).toFixed(1)}" x2="${W}" y2="${y(alert).toFixed(1)}"
+            stroke="var(--warn)" stroke-width="1" stroke-dasharray="4 3" opacity=".8"/>
+      <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="1.6"/>
+    </svg>`;
+  },
+
+  render(d) {
+    const cards = [];
+    const c = d.condition, p = c && c.prediction;
+    const health = !p ? "unknown"
+      : p.latest_vibration >= p.danger_limit ? "danger"
+      : p.in_alert_zone ? "alert" : "healthy";
+
+    cards.push(`<div class="a3-card a3-hero">
+      <div>
+        <div class="a3-id">${esc(d.id)}</div>
+        <div class="a3-sub">${esc(d.label)} · ${esc(d.type)}</div>
+      </div>
+      <span class="a3-pill h-${health}">${health}</span>
+      <span class="a3-spacer"></span>
+      <div class="a3-chips">
+        <span class="a3-chip">P&amp;ID <b>${esc(d.pid.drawing || "—")}</b> rev ${esc(d.pid.revision || "—")}</span>
+        <span class="a3-chip">work orders <b>${d.maintenance.count}</b></span>
+        <span class="a3-chip">downtime <b>${d.maintenance.total_downtime_hours} h</b></span>
+        <span class="a3-chip">documents <b>${d.documents.length}</b></span>
+      </div>
+    </div>`);
+
+    if (p) {
+      cards.push(`<div class="a3-card">
+        <h4>Live condition — ${esc(p.signal || "vibration")}</h4>
+        <div class="a3-big" style="color:var(--${health === "danger" ? "bad" : health === "alert" ? "warn" : "good"})">
+          ${p.latest_vibration} <span style="font-size:12px;color:var(--dim)">mm/s</span></div>
+        ${Asset360.sparkline(c.series, p)}
+        <div class="a3-kv"><span>Baseline</span><span>${p.baseline_vibration} mm/s</span></div>
+        <div class="a3-kv"><span>Alert / danger limit</span><span>${p.alert_limit} / ${p.danger_limit} mm/s</span></div>
+        <div class="a3-kv"><span>Trend</span><span>${p.trend_mm_s_per_day > 0 ? "+" : ""}${p.trend_mm_s_per_day} mm/s per day</span></div>
+        <div class="a3-kv"><span>Bearing temperature</span><span>${p.bearing_temp_recent_c ?? "—"} °C</span></div>
+        <div class="a3-kv"><span>Anomaly</span><span>${p.anomaly ? "YES" : "no"}</span></div>
+        <div class="a3-note">14-day trend · dashed lines are the ISO 10816 alert and danger limits.</div>
+      </div>`);
+      cards.push(`<div class="a3-card">
+        <h4>Predicted remaining useful life</h4>
+        <div class="a3-big" style="color:var(--${p.rul_days <= 3 ? "bad" : p.rul_days <= 14 ? "warn" : "good"})">
+          ${p.rul_days ?? "—"} <span style="font-size:12px;color:var(--dim)">days</span></div>
+        <div class="a3-note">Trend extrapolation of the vibration signal to the
+          danger limit. An estimate from the sensor stream — not a guarantee.</div>
+      </div>`);
+    }
+
+    if (d.maintenance.failure_modes.length) {
+      cards.push(`<div class="a3-card">
+        <h4>Failure history</h4>
+        <div class="a3-chips" style="margin-bottom:9px">
+          ${d.maintenance.failure_modes.map(f =>
+            `<span class="a3-chip"><b>${f.count}×</b> ${esc(f.mode)}</span>`).join("")}
+        </div>
+        ${d.maintenance.work_orders.map(w => `
+          <div class="a3-wo ${esc(w.type)}">
+            <div class="r1"><span class="wo">${esc(w.wo_number)}</span>
+              <span class="dt">${esc(w.date)} · ${esc(w.type)} · ${esc(w.downtime_hours)}h</span></div>
+            <div class="r2">${esc(w.symptom || "")}${w.cause ? " → <i>" + esc(w.cause) + "</i>" : ""}</div>
+            <div class="r2" style="color:var(--faint)">${esc(w.action || "")}</div>
+          </div>`).join("")}
+      </div>`);
+    }
+
+    if (d.spares.length) {
+      cards.push(`<div class="a3-card">
+        <h4>Spares</h4>
+        ${d.spares.map(s => `<div class="a3-kv">
+          <span>${esc(s.part_number)} — ${esc(s.description || "")}</span>
+          <span class="${Number(s.qty_on_hand) <= Number(s.min_stock) ? "a3-low" : ""}">${
+            esc(s.qty_on_hand)} / min ${esc(s.min_stock)}</span></div>`).join("")}
+      </div>`);
+    }
+
+    const g = d.graph;
+    const grp = (title, items) => items.length
+      ? `<div style="margin-bottom:8px"><div style="color:var(--faint);font-size:10.5px;margin-bottom:4px">${title}</div>
+         <div class="a3-chips">${items.map(i =>
+           `<span class="a3-chip"><b>${esc(i.id)}</b> ${esc(i.type)}</span>`).join("")}</div></div>` : "";
+    cards.push(`<div class="a3-card">
+      <h4>Connected equipment (from P&amp;ID)</h4>
+      ${grp("Connected to", g.connected_to)}
+      ${grp("Measured by", g.measured_by)}
+      ${grp("Failure modes", g.failure_modes)}
+      ${grp("Other", g.other)}
+    </div>`);
+
+    if (d.documents.length) {
+      cards.push(`<div class="a3-card">
+        <h4>Documents referencing this asset</h4>
+        ${d.documents.map(x => `<div class="a3-kv">
+          <span>${esc(x.title)}</span><span>${x.chunks} chunk${x.chunks > 1 ? "s" : ""}</span>
+        </div>`).join("")}
+        <div class="a3-note">Ask a question to see these cited as evidence.</div>
+      </div>`);
+    }
+
+    $("#a3-body").innerHTML = cards.join("");
+  },
+};

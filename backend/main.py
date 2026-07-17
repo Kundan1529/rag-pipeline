@@ -153,6 +153,138 @@ def pid():
     return corpus.pid
 
 
+# --------------------------------------------------------------- Asset360
+
+ASSET_TYPES = {"Pump", "Motor", "Valve", "Tank", "Exchanger", "Instrument"}
+
+
+@app.get("/api/assets")
+def assets():
+    """Every physical asset in the knowledge graph, with a live health
+    verdict. Drives the Asset360 asset picker."""
+    out = []
+    for node_id, data in graph.nodes.items():
+        if data.get("type") not in ASSET_TYPES:
+            continue
+        wos = [w for w in corpus.maintenance if w["equipment"] == node_id]
+        health = "unknown"
+        if node_id == predictive.ANCHOR_ASSET:
+            pred = predictive.analyze(corpus.sensors)
+            health = ("danger" if pred.get("latest_vibration", 0)
+                      >= pred.get("danger_limit", 99) else
+                      "alert" if pred.get("in_alert_zone") else "healthy")
+        out.append({
+            "id": node_id,
+            "type": data.get("type"),
+            "label": data.get("label", node_id),
+            "work_orders": len(wos),
+            "monitored": node_id == predictive.ANCHOR_ASSET,
+            "health": health,
+        })
+    out.sort(key=lambda a: (not a["monitored"], a["id"]))
+    return {"assets": out}
+
+
+@app.get("/api/asset/{asset_id}")
+def asset360(asset_id: str):
+    """Complete digital profile of one asset: identity, live condition and
+    prediction, maintenance history, spares, documents, connected
+    equipment, instruments and failure modes.
+
+    Every field is assembled from data the system ALREADY holds — the
+    knowledge graph, the maintenance log, the spares list, the sensor
+    series and the ingested documents. Nothing here is generated; the
+    dashboard is a view over the system of record.
+    """
+    node = graph.nodes.get(asset_id)
+    if node is None or node.get("type") not in ASSET_TYPES:
+        raise HTTPException(404, f"Unknown asset: {asset_id}")
+
+    # --- graph neighbourhood, split by relationship -------------------
+    connected, measured_by, documented_by, failure_modes, other = (
+        [], [], [], [], [])
+    for target, rel in graph.neighbors(asset_id):
+        entry = {"id": target, "rel": rel,
+                 "type": graph.nodes.get(target, {}).get("type", "?"),
+                 "label": graph.nodes.get(target, {}).get("label", target)}
+        if rel == "CONNECTED_TO":
+            connected.append(entry)
+        elif rel == "MEASURED_BY":
+            measured_by.append(entry)
+        elif rel == "DOCUMENTED_BY":
+            documented_by.append(entry)
+        elif rel in ("HAS_FAILURE_MODE", "FAILS_AS"):
+            failure_modes.append(entry)
+        else:
+            other.append(entry)
+
+    # --- maintenance history ------------------------------------------
+    history = sorted(
+        (w for w in corpus.maintenance if w["equipment"] == asset_id),
+        key=lambda w: w["date"], reverse=True)
+    downtime = sum(float(w.get("downtime_hours") or 0) for w in history)
+    modes: dict[str, int] = {}
+    for w in history:
+        if w.get("failure_mode"):
+            modes[w["failure_mode"]] = modes.get(w["failure_mode"], 0) + 1
+
+    # --- spares referenced by this asset's history --------------------
+    part_nos = {p.strip().split(" x")[0]
+                for w in history for p in (w.get("parts_used") or "").split(",")
+                if p.strip()}
+    spares = [s for s in corpus.spares if s["part_number"] in part_nos
+              or asset_id in s.get("description", "")]
+    for s in spares:
+        s = s.setdefault("low_stock",
+                         int(s.get("qty_on_hand", 0)) <= int(s.get("min_stock", 0)))
+
+    # --- documents that mention this asset ----------------------------
+    doc_hits: dict[str, int] = {}
+    for c in corpus.chunks:
+        if asset_id in c.entities:
+            doc_hits[c.doc_no] = doc_hits.get(c.doc_no, 0) + 1
+    documents = [{"doc_no": d, "title": corpus.docs.get(d, {}).get("title", d),
+                  "chunks": n} for d, n in
+                 sorted(doc_hits.items(), key=lambda x: -x[1])]
+
+    # --- live condition + prediction (only for the monitored asset) ----
+    condition = None
+    if asset_id == predictive.ANCHOR_ASSET:
+        pred = predictive.analyze(corpus.sensors)
+        condition = {
+            "prediction": pred,
+            "series": corpus.sensors[-14 * 24:],
+        }
+
+    return {
+        "id": asset_id,
+        "type": node.get("type"),
+        "label": node.get("label", asset_id),
+        "properties": {k: v for k, v in node.items()
+                       if k not in ("type", "label")},
+        "condition": condition,
+        "maintenance": {
+            "work_orders": history,
+            "count": len(history),
+            "total_downtime_hours": round(downtime, 1),
+            "failure_modes": [{"mode": m, "count": n}
+                              for m, n in sorted(modes.items(),
+                                                 key=lambda x: -x[1])],
+        },
+        "spares": spares,
+        "documents": documents,
+        "graph": {
+            "connected_to": connected,
+            "measured_by": measured_by,
+            "documented_by": documented_by,
+            "failure_modes": failure_modes,
+            "other": other,
+        },
+        "pid": {"drawing": corpus.pid.get("drawing"),
+                "revision": corpus.pid.get("revision")},
+    }
+
+
 @app.get("/api/documents")
 def documents():
     """List every ingested document with its chunk/concept counts. Uploaded
@@ -354,5 +486,8 @@ async def upload(file: UploadFile = File(...)):
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # PORT env var lets the app run alongside another instance (or under a
+    # process manager) without editing code; defaults to the documented 8000.
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8000")))

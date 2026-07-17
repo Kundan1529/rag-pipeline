@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "axon",
+      "runtimeExecutable": "/Users/kundankumar/deep learning/.venv/bin/python",
+      "runtimeArgs": ["backend/main.py"],
+      "port": 8000,
+      "autoPort": true
+    }
+  ]
+}
