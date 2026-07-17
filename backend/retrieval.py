@@ -1448,18 +1448,33 @@ class HybridIndex:
             legs["graph"] = graph_hits
         rrf = self._rrf_fusion(legs)
 
+        # The CLEAN question — used for judging RELEVANCE (cross-encoder,
+        # metadata keywords). `query` is the rewritten/expanded string whose
+        # appended scaffolding ("definition overview comparison") exists to
+        # widen LEXICAL recall; feeding it to the relevance scorers actively
+        # misranks. Measured on "key difference between LangChain and
+        # LangGraph" (cross-encoder, LangGraph-definition vs LangSmith):
+        #     raw query       -> 0.703 vs 0.516  (gap +0.187)
+        #     rewritten query -> 0.630 vs 0.505  (gap +0.125, -33%)
+        # and the appended word "comparison" matched LangSmith's ingest
+        # keywords, handing it metadata boost 1.36 vs 1.26 — enough to
+        # overturn the cross-encoder and rank a tangential LangSmith page
+        # above the actual LangGraph definition.
+        judge_query = getattr(query_plan, "original_query", None) or query
+
         # ---- Stage 4: bounded metadata boost ------------------------------
-        boosted = self._apply_metadata_boost(rrf, query_plan, query)
+        boosted = self._apply_metadata_boost(rrf, query_plan, judge_query)
 
         # ---- Stage 5: adaptive candidate pool + cross-encoder rerank ------
         pool_size = self._candidate_pool_size(query, k)
         reranked, reranker_scores = self._semantic_rerank(
-            query, boosted, top_n=pool_size,
+            judge_query, boosted, top_n=pool_size,
         )
 
         # ---- Stage 5b: reranker-collapse fallback --------------------------
         reranked, reranker_scores, _ce_collapsed = (
-            self._apply_ce_collapse_fallback(query, reranked, reranker_scores)
+            self._apply_ce_collapse_fallback(
+                judge_query, reranked, reranker_scores)
         )
 
         # ---- Stage 6: entity-aware score fusion ---------------------------
