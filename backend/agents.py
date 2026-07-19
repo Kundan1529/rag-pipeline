@@ -1744,11 +1744,32 @@ class AgentSystem:
             # 0.10, every claim INSUFFICIENT) that shipped as RELEASE.
             # =========================================================
 
+            # Two independent suppression conditions:
+            #  (a) low average coverage with more ungrounded than grounded
+            #      claims — catches wholly-fabricated answers (coverage ~0.1);
+            #  (b) MAJORITY of factual claims ungrounded, at ANY average
+            #      coverage — catches out-of-corpus questions where the topic
+            #      IS in the corpus so the answer carries grounded background
+            #      ("LangSmith is for tracing [1]") that lifts average
+            #      coverage to ~0.55, while the claim that actually answers
+            #      the question (the pricing, the CEO) is fabricated.
+            #      Measured: leaked negatives sit at ungrounded-ratio 0.5;
+            #      valid answers at <=0.4, so 0.5 separates them and keeps
+            #      genuine partial answers.
             COVERAGE_FLOOR = 0.35
+            UNGROUNDED_MAJORITY = 0.5
+            total_claims = len(validation.get("claims", []))
+            insufficient = validation.get("insufficient_evidence_claims", 0)
+            supported = validation.get("supported_claims", 0)
+            ungrounded_ratio = (insufficient / total_claims
+                                if total_claims else 0.0)
+            low_coverage = (validation.get("coverage", 1.0) < COVERAGE_FLOOR
+                            and insufficient > supported)
+            majority_ungrounded = (total_claims >= 2
+                                   and ungrounded_ratio >= UNGROUNDED_MAJORITY
+                                   and supported <= insufficient)
             if (not validation.get("valid")
-                    and validation.get("coverage", 1.0) < COVERAGE_FLOOR
-                    and validation.get("insufficient_evidence_claims", 0)
-                        > validation.get("supported_claims", 0)):
+                    and (low_coverage or majority_ungrounded)):
                 docs = sorted({e.get("doc_no", "?") for e in evidence})[:3]
                 answer = (
                     "## Insufficient Evidence\n\n"
@@ -1760,11 +1781,14 @@ class AgentSystem:
                     + "Try rephrasing the question, or name the document "
                       "you mean (e.g. \"in the person_resume, ...\").")
                 answer_source = "confidence-floor"
+                reason = ("majority of claims ungrounded "
+                          f"({insufficient}/{total_claims})"
+                          if majority_ungrounded else
+                          f"coverage {validation.get('coverage', 0.0):.2f} "
+                          f"< {COVERAGE_FLOOR}")
                 validation["confidence_floor"] = (
-                    f"answer suppressed — coverage "
-                    f"{validation.get('coverage', 0.0):.2f} < {COVERAGE_FLOOR} "
-                    f"with {validation.get('insufficient_evidence_claims', 0)} "
-                    "ungrounded claim(s)")
+                    f"answer suppressed — {reason} "
+                    f"({insufficient} ungrounded claim(s))")
                 print(f"⛔ Confidence floor: {validation['confidence_floor']}")
 
             if not validation["valid"]:
@@ -1822,12 +1846,23 @@ class AgentSystem:
                 gr["seeds"],
             )
 
+            # When the confidence floor already replaced the answer with an
+            # insufficient-evidence response, the critic must report a
+            # refusal, not grade the (now-removed) draft. Otherwise the UI
+            # shows "RELEASE" over an "Insufficient Evidence" body.
+            if answer_source == "confidence-floor":
+                critic = {"checks": [], "confidence": 0.15,
+                          "verdict": "REFUSE — INSUFFICIENT GROUNDED EVIDENCE",
+                          "policy": "confidence-floor",
+                          "unsupported": 0}
+
             # =========================================================
             # STEP 5 — Add warning only to final answer
             # =========================================================
 
             if (
-                critic.get("unsupported", 0) > 0
+                answer_source != "confidence-floor"
+                and critic.get("unsupported", 0) > 0
                 and critic["verdict"] != "RELEASE"
             ):
 
