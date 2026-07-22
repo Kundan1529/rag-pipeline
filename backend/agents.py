@@ -15,6 +15,7 @@ from collections import defaultdict
 import llm
 import memory as convmem
 import predictive as predictive_mod
+import response_engine
 from ingest import Corpus, DATA_DIR, TAG_RE
 from kg import KnowledgeGraph
 from retrieval import HybridIndex
@@ -22,6 +23,41 @@ from query_processor import QueryProcessor
 from validator import AnswerValidator
 from conversation import ConversationContext
 from reasoning_trace import ReasoningTrace
+
+_FOLLOWUP_HEADING = re.compile(
+    r"#{1,4}\s*Suggested\s+Follow-?up\s+Questions\s*\n(.*)$",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _extract_followups(answer: str,
+                       entities: list[str] | None = None,
+                       anchor: str | None = None) -> list[str]:
+    """Structured follow-up suggestions for the UI (Module 02, req. 9).
+
+    Prefers the model's own "Suggested Follow-up Questions" section; if the
+    model omitted it, synthesizes a few grounded next questions from the
+    query's entities/anchor so every answer still ends with useful next steps.
+    """
+    out: list[str] = []
+    if answer:
+        m = _FOLLOWUP_HEADING.search(answer)
+        if m:
+            for line in m.group(1).splitlines():
+                line = line.strip().lstrip("-*•").strip()
+                line = re.sub(r"^\d+[.)]\s*", "", line)
+                if line.endswith("?") or (line and len(line.split()) >= 3):
+                    out.append(line)
+                if len(out) >= 4:
+                    break
+    if out:
+        return out
+    # Deterministic fallback — never leave the user without next steps.
+    subject = anchor or (entities[0] if entities else None)
+    if subject:
+        out = [f"What causes issues with {subject}?",
+               f"Show the maintenance history for {subject}.",
+               f"Which documents reference {subject}?"]
+    return out
 
 
 class EvidenceOrganizer:
@@ -527,6 +563,95 @@ class AgentSystem:
         return {"anchor": anchor, "subgraph_nodes": sorted(nodes), "subgraph_edges": edges,
                 "connected_to": connected, "measured_by": measured_by,
                 "history": history, "similar_count": len(similar), "candidate_cause": candidate}
+
+    @staticmethod
+    def _synthetic_evidence(*, doc_no: str, doc_title: str, section: str,
+                            revision: str, text: str,
+                            matched: list[str]) -> dict:
+        """Build an evidence item from structured system-of-record data, in the
+        exact shape retrieval produces so it is citable, verifiable and
+        renderable like any retrieved chunk."""
+        return {
+            "chunk_id": f"{doc_no}::data",
+            "doc_no": doc_no, "doc_title": doc_title, "section": section,
+            "revision": revision, "page": 1, "text": text,
+            "summary": text[:200], "score": 0.9, "rrf_score": 0.0,
+            "reranker_score": 0.9,
+            "matched_entities": [m for m in matched if m],
+            "selected_because": ("structured system-of-record data "
+                                 "(live telemetry / maintenance log)"),
+            "entities": [], "keywords": [], "concepts": [], "synthetic": True,
+        }
+
+    def _asset_data_evidence(self, anchor: str, findings: dict) -> list[dict]:
+        """The monitored asset's OWN data as first-class, citable evidence.
+
+        Live telemetry (the sensor stream) and maintenance work-order history
+        (the maintenance log) are facts in the system of record, not in any
+        retrievable text chunk. Without promoting them here they live only in
+        the case-file findings — with no evidence id — so the validator can
+        neither see nor verify claims grounded in them ("vibration 5.45 mm/s",
+        "WO-8811"), flags every one as ungrounded, and the confidence floor
+        suppresses an otherwise-correct answer. Promoting them lets the LLM
+        cite the data and the validator confirm it.
+        """
+        items: list[dict] = []
+        p = findings.get("predictive") or {}
+        if anchor == getattr(predictive_mod, "ANCHOR_ASSET", None) and p:
+            zone = ("above the danger limit"
+                    if p.get("latest_vibration", 0) >= p.get("danger_limit", 1e9)
+                    else "in the alert zone" if p.get("in_alert_zone")
+                    else "within normal limits")
+            text = (
+                f"Live condition monitoring for {anchor} (vibration transmitter "
+                f"VT-101 on the drive-end bearing). Current "
+                f"{p.get('signal', 'vibration')} is {p.get('latest_vibration')} "
+                f"mm/s velocity RMS, {zone}. Baseline "
+                f"{p.get('baseline_vibration')} mm/s; trend rising at "
+                f"+{p.get('trend_mm_s_per_day')} mm/s per day. Alert limit "
+                f"{p.get('alert_limit')} mm/s and danger limit "
+                f"{p.get('danger_limit')} mm/s per SOP-315 (ISO 10816). "
+                f"Estimated remaining useful life {p.get('rul_days')} days. "
+                f"Bearing temperature {p.get('bearing_temp_recent_c')} °C "
+                f"(normal). Anomaly detected: "
+                f"{'yes' if p.get('anomaly') else 'no'}."
+            )
+            items.append(self._synthetic_evidence(
+                doc_no="VT-101",
+                doc_title=f"Live Condition Monitoring — {anchor} (VT-101)",
+                section="Vibration telemetry", revision="live", text=text,
+                matched=[anchor.lower(), "vibration", "vt-101"]))
+
+        history = (findings.get("rootcause") or {}).get("history") or []
+        for wo in sorted(history, key=lambda w: w.get("date", ""),
+                         reverse=True)[:6]:
+            fm = (wo.get("failure_mode") or "").strip()
+            cause = (wo.get("cause") or wo.get("root_cause") or "").strip()
+            action = (wo.get("action") or wo.get("corrective_action") or "").strip()
+            parts = [f"Work order {wo.get('wo_number', '')} dated "
+                     f"{wo.get('date', '')} on {wo.get('equipment', anchor)}"]
+            if wo.get("type"):
+                parts.append(f"{wo['type']} maintenance")
+            if fm and fm.lower() not in ("none", ""):
+                parts.append(f"failure mode {fm}")
+            if cause and cause.lower() not in ("none", ""):
+                parts.append(f"root cause {cause}")
+            if action:
+                parts.append(f"action taken: {action}")
+            pu = str(wo.get("parts_used") or "").strip()
+            if pu and pu.lower() not in ("none", ""):
+                parts.append(f"parts used {pu}")
+            if wo.get("downtime_hours"):
+                parts.append(f"downtime {wo['downtime_hours']} hours")
+            items.append(self._synthetic_evidence(
+                doc_no=wo.get("wo_number", "WO"),
+                doc_title=(f"Maintenance Work Order {wo.get('wo_number', '')} "
+                           f"— {wo.get('equipment', anchor)}"),
+                section="Maintenance history",
+                revision=str(wo.get("date", "")),
+                text="; ".join(parts) + ".",
+                matched=[anchor.lower(), "maintenance", fm.lower()]))
+        return items
 
     def _accept_evidence(self, query: str, query_plan, hits: list[dict],
                          k: int = 6) -> tuple[list[dict], dict[str, str]]:
@@ -1394,6 +1519,8 @@ class AgentSystem:
             "evidence_diagnostics": None,
             "graph_highlight": highlight,
             "memory_answer": True,
+            "response_profile": response_engine.analyze(query).as_dict(),
+            "followups": _extract_followups(answer),
         }
 
     def run_case(self, query: str, history: list | None = None) -> dict:
@@ -1406,6 +1533,38 @@ class AgentSystem:
         if history and convmem.is_meta_query(query):
             return self._conversation_case(query, history, trace)
         query = self.context.rewrite(query)
+        # Adaptive Response Engine (Module 02): detect HOW the user wants the
+        # answer — output format, reading level, length, persona — FIRST, then
+        # strip the styling phrases out of the retrieval query. This must run
+        # BEFORE spell correction: styling words are the user's literal request
+        # and must not be "corrected" (e.g. spell-check rewrote "bullet" →
+        # "built", which both lost the bullet-format request and corrupted
+        # retrieval). Stripping first means spell-check only ever sees the real
+        # question.
+        response_profile = response_engine.analyze(query)
+        style_directives = response_profile.directives
+        if not response_profile.is_empty:
+            stripped = response_profile.stripped_query
+            detected = {k: v for k, v in {
+                "persona": response_profile.persona,
+                "reading_level": response_profile.reading_level,
+                "length": response_profile.length,
+                "formats": ", ".join(response_profile.formats) or None,
+            }.items() if v}
+            print(f"Adaptive response profile: {detected}; "
+                  f"retrieval query: {stripped!r}")
+            trace.add(
+                stage="style",
+                title="Adaptive Response Engine",
+                summary=("Response adapted to "
+                         + (", ".join(f"{k}={v}" for k, v in detected.items())
+                            or "default style")),
+                directives=style_directives,
+                retrieval_query=stripped,
+                **detected,
+            )
+            if stripped != query:
+                query = stripped
         # Spell correction BEFORE any intent/entity/aspect logic. One typo
         # ("differece") otherwise defeats the "difference between" intent
         # pattern, so the query is misrouted as definition, no comparison
@@ -1425,25 +1584,6 @@ class AgentSystem:
                     confidence=sp.confidence,
                     corrected_query=query,
                 )
-        # Style requests ("give answers in points", "as a table") are
-        # PROMPT instructions, not search terms. Detect them, then strip
-        # them from the retrieval path — left in, 'points' became an entity
-        # and steered retrieval toward the paper's 'point-wise' chunks.
-        style_directives = llm.detect_style_directives(query)
-        if style_directives:
-            stripped = llm.strip_style_phrases(query)
-            if stripped != query:
-                print(f"Style request separated ({len(style_directives)} "
-                      f"directive(s)); retrieval query: {stripped!r}")
-                trace.add(
-                    stage="style",
-                    title="Response Style",
-                    summary=f"{len(style_directives)} style directive(s) "
-                            "routed to the prompt",
-                    directives=style_directives,
-                    retrieval_query=stripped,
-                )
-                query = stripped
         query_plan = self.query_processor.process(query)
         print("\n=== QUERY PLAN ===")
         print("Original query:", query_plan.original_query)
@@ -1561,6 +1701,17 @@ class AgentSystem:
             print("Selected because:", item.get("selected_because"))
             print("Text:", item.get("text", "")[:500])
         findings["evidence"] = evidence
+        # Promote the monitored asset's own structured data (live telemetry +
+        # maintenance work-order history) into the evidence set so it is
+        # citable by the LLM and verifiable by the validator. Appended after
+        # the retrieved chunks, so their evidence ids are unaffected.
+        if anchor:
+            data_ev = self._asset_data_evidence(anchor, findings)
+            if data_ev:
+                evidence.extend(data_ev)
+                findings["evidence"] = evidence
+                print(f"Promoted {len(data_ev)} structured data evidence "
+                      f"item(s) for {anchor} (telemetry + maintenance history)")
         findings["evidence_sufficiency"] = (
                     self._evidence_sufficiency(
                         evidence=evidence,
@@ -1668,6 +1819,7 @@ class AgentSystem:
                 # what lets a long chat connect back to earlier discussion.
                 convmem.curate(query, history),
                 style_directives=style_directives,
+                profile=response_profile,
             )
 
             # =========================================================
@@ -1758,38 +1910,87 @@ class AgentSystem:
             #      genuine partial answers.
             COVERAGE_FLOOR = 0.35
             UNGROUNDED_MAJORITY = 0.5
+            used_asset_template = False
             total_claims = len(validation.get("claims", []))
             insufficient = validation.get("insufficient_evidence_claims", 0)
             supported = validation.get("supported_claims", 0)
-            ungrounded_ratio = (insufficient / total_claims
+
+            # Fabrication vs. grounded-synthesis. The floor exists to suppress
+            # answers whose content is NOT in the corpus (fabrication), not
+            # well-grounded answers a weak model merely under-cited or
+            # mis-cited. A fabricated claim's invented specifics (a price, a
+            # name, a made-up term) appear in no chunk, so its best evidence
+            # has LOW lexical AND LOW semantic support; grounded synthesis has
+            # HIGH both. NLI entailment against a single retrieved chunk is
+            # near-zero for a claim synthesized across pages, which tanks the
+            # support score — but that is not fabrication. So a claim counts as
+            # fabricated only when its best evidence does NOT strongly cover it,
+            # or the evidence actively contradicts it (entity swap).
+            GROUNDED_LEXICAL = 0.5
+            GROUNDED_SEMANTIC = 0.85
+
+            def _corpus_grounded(claim: dict) -> bool:
+                be = claim.get("best_evidence") or {}
+                lex = be.get("lexical_score") or 0.0
+                sem = be.get("semantic_score") or 0.0
+                contra = claim.get("nli_contradiction") or 0.0
+                return (lex >= GROUNDED_LEXICAL and sem >= GROUNDED_SEMANTIC
+                        and contra < 0.5)
+
+            claim_reports = validation.get("claims", [])
+            fabricated = sum(
+                1 for c in claim_reports
+                if c.get("status") == "INSUFFICIENT_EVIDENCE"
+                and not _corpus_grounded(c))
+            grounded = total_claims - fabricated  # supported + grounded synthesis
+            ungrounded_ratio = (fabricated / total_claims
                                 if total_claims else 0.0)
             low_coverage = (validation.get("coverage", 1.0) < COVERAGE_FLOOR
-                            and insufficient > supported)
+                            and fabricated > grounded)
             majority_ungrounded = (total_claims >= 2
                                    and ungrounded_ratio >= UNGROUNDED_MAJORITY
-                                   and supported <= insufficient)
+                                   and fabricated >= grounded)
             if (not validation.get("valid")
                     and (low_coverage or majority_ungrounded)):
-                docs = sorted({e.get("doc_no", "?") for e in evidence})[:3]
-                answer = (
-                    "## Insufficient Evidence\n\n"
-                    "The retrieved documents do not contain enough grounded "
-                    "information to answer this question reliably, so no "
-                    "speculative answer is being generated.\n\n"
-                    + (f"Closest material found: {', '.join(docs)}.\n\n"
-                       if docs else "")
-                    + "Try rephrasing the question, or name the document "
-                      "you mean (e.g. \"in the person_resume, ...\").")
-                answer_source = "confidence-floor"
-                reason = ("majority of claims ungrounded "
-                          f"({insufficient}/{total_claims})"
-                          if majority_ungrounded else
-                          f"coverage {validation.get('coverage', 0.0):.2f} "
-                          f"< {COVERAGE_FLOOR}")
-                validation["confidence_floor"] = (
-                    f"answer suppressed — {reason} "
-                    f"({insufficient} ungrounded claim(s))")
-                print(f"⛔ Confidence floor: {validation['confidence_floor']}")
+                # A monitored asset with a diagnosed root cause is NOT an
+                # ungrounded case: its facts (telemetry + maintenance history)
+                # are held in the system of record. The generic LLM draft was
+                # suppressed only because a small model under-cited them. Rather
+                # than refuse, answer from the deterministic, fully-cited asset
+                # template — strictly better than both the draft and a refusal,
+                # and grounded in the same data Asset360 shows.
+                if (anchor and findings.get("predictive")
+                        and findings.get("rootcause", {}).get("candidate_cause")):
+                    answer = self._template_answer(query, anchor, findings,
+                                                   response_profile)
+                    answer_source = "asset-data"
+                    used_asset_template = True
+                    validation["confidence_floor"] = (
+                        "draft suppressed; answered from the grounded asset-data "
+                        "template (live telemetry + maintenance history)")
+                    print("⛔→✓ Confidence floor: replaced under-cited draft "
+                          "with the grounded asset-data template")
+                else:
+                    docs = sorted({e.get("doc_no", "?") for e in evidence})[:3]
+                    answer = (
+                        "## Insufficient Evidence\n\n"
+                        "The retrieved documents do not contain enough grounded "
+                        "information to answer this question reliably, so no "
+                        "speculative answer is being generated.\n\n"
+                        + (f"Closest material found: {', '.join(docs)}.\n\n"
+                           if docs else "")
+                        + "Try rephrasing the question, or name the document "
+                          "you mean (e.g. \"in the person_resume, ...\").")
+                    answer_source = "confidence-floor"
+                    reason = ("majority of claims not grounded in the corpus "
+                              f"({fabricated}/{total_claims})"
+                              if majority_ungrounded else
+                              f"coverage {validation.get('coverage', 0.0):.2f} "
+                              f"< {COVERAGE_FLOOR}")
+                    validation["confidence_floor"] = (
+                        f"answer suppressed — {reason} "
+                        f"({fabricated} fabricated claim(s))")
+                    print(f"⛔ Confidence floor: {validation['confidence_floor']}")
 
             if not validation["valid"]:
                 print(
@@ -1854,6 +2055,15 @@ class AgentSystem:
                 critic = {"checks": [], "confidence": 0.15,
                           "verdict": "REFUSE — INSUFFICIENT GROUNDED EVIDENCE",
                           "policy": "confidence-floor",
+                          "unsupported": 0}
+            # The asset-data template is hand-composed from the system of
+            # record (telemetry + maintenance log) and cites the retrieved
+            # procedures — it is grounded by construction, so release it
+            # rather than grade the discarded LLM draft.
+            elif used_asset_template:
+                critic = {"checks": [], "confidence": 0.82,
+                          "verdict": "RELEASE — GROUNDED IN ASSET DATA",
+                          "policy": "asset-data-template",
                           "unsupported": 0}
 
             # =========================================================
@@ -1971,6 +2181,10 @@ class AgentSystem:
             "answer": answer, "answer_source": answer_source,
             "evidence_diagnostics": self._retrieval_diagnostics,
             "graph_highlight": self._support_graph(query, answer, evidence, anchor, findings),
+            # Adaptive Response Engine: what style was detected, and structured
+            # follow-ups so the UI never depends on parsing the answer text.
+            "response_profile": response_profile.as_dict(),
+            "followups": _extract_followups(answer, sup.get("entities"), anchor),
         }
 
     # ------------------------------------------------------ vanilla baseline
@@ -2975,6 +3189,7 @@ class AgentSystem:
     findings: dict,
     history: list | None = None,
     style_directives: list[str] | None = None,
+    profile=None,
 ) -> tuple[str, str]:
 
         case_file = self._case_file_text(
@@ -3106,6 +3321,7 @@ class AgentSystem:
                 findings.get("query_plan"), "intent", None,
             ),
             style_directives=style_directives,
+            profile=profile,
         )
 
         if answer:
@@ -3121,14 +3337,21 @@ class AgentSystem:
                 query,
                 anchor,
                 findings,
+                profile,
             ),
             "deterministic (no LLM credentials)",
         )
     @staticmethod
-    def _extractive_answer(query: str, evidence: list[dict]) -> str:
+    def _extractive_answer(query: str, evidence: list[dict],
+                           profile=None) -> str:
         """Readable extractive summary when no LLM is available: pick clean prose
         sentences from the evidence (filtering out code, imports, headings and
-        fragments), preferring ones that mention the query's terms."""
+        fragments), preferring ones that mention the query's terms.
+
+        Format-aware: when the Adaptive Response Engine detected a requested
+        output format (table / checklist / bullets), the extracted points are
+        rendered in that shape, so a "in tabular format" request is honoured
+        even with no LLM available."""
         stop = {
             "about", "explain", "detail", "details", "what", "which", "that",
             "this", "with", "from", "your", "need", "does", "into", "overview",
@@ -3204,12 +3427,30 @@ class AgentSystem:
             picked = [(clean(evidence[0].get("text", ""))[:260], evidence[0])]
 
         title = evidence[0].get("doc_title") or evidence[0].get("doc_no", "the retrieved document")
+        formats = set(getattr(profile, "formats", []) or [])
+
+        def _cell(text: str) -> str:                    # keep Markdown table cells intact
+            return text.replace("|", "\\|").replace("\n", " ").strip()
+
         parts = ["## Direct Answer",
                  f"From **{title}**: {picked[0][0]}  _({picked[0][1]['doc_no']}, {picked[0][1]['section']})_"]
-        if len(picked) > 1:
+
+        if len(picked) > 1 and ({"table", "comparison"} & formats):
+            # Requested a table → render the extracted points as a Markdown table.
+            parts.append("## Key Points")
+            parts.append("| # | Key point | Source |")
+            parts.append("|---|-----------|--------|")
+            for i, (s, e) in enumerate(picked[1:6], start=1):
+                parts.append(f"| {i} | {_cell(s)} | {e['doc_no']} ({_cell(e['section'])}) |")
+        elif len(picked) > 1 and "checklist" in formats:
+            parts.append("## Key Points")
+            for s, e in picked[1:6]:
+                parts.append(f"- [ ] {s}  _({e['doc_no']}, {e['section']})_")
+        elif len(picked) > 1:
             parts.append("## Key Points")
             for s, e in picked[1:5]:
                 parts.append(f"- {s}  _({e['doc_no']}, {e['section']})_")
+
         parts.append("## Sources")
         seen_src = set()
         for e in evidence[:6]:
@@ -3218,12 +3459,18 @@ class AgentSystem:
                 continue
             seen_src.add(k)
             parts.append(f"- **{e['doc_no']}** ({e['section']})")
-        parts.append("\n_The AI answer engine is currently unavailable, so this is an "
-                     "extractive summary of the retrieved evidence rather than a composed answer._")
+        note = ("\n_The AI answer engine is currently unavailable, so this is an "
+                "extractive summary of the retrieved evidence rather than a composed answer._")
+        if {"table", "comparison"} & formats:
+            note += ("\n_Note: without a language model the table lists the extracted "
+                     "evidence points; a composed comparison table needs a live LLM "
+                     "(add HuggingFace credits or set ANTHROPIC_API_KEY)._")
+        parts.append(note)
         return "\n".join(parts)
 
     @staticmethod
-    def _template_answer(query: str, anchor: str | None, findings: dict) -> str:
+    def _template_answer(query: str, anchor: str | None, findings: dict,
+                         profile=None) -> str:
         if not anchor or "predictive" not in findings:
             ev = findings.get("evidence", [])
             if not ev:
@@ -3231,7 +3478,7 @@ class AgentSystem:
                         "Per the grounded-or-refuse policy this is escalated to a human expert — "
                         "and logged as a **knowledge gap**: if this question matters to operations, "
                         "the procedure should be captured before the expertise walks out the door.")
-            return AgentSystem._extractive_answer(query, ev)
+            return AgentSystem._extractive_answer(query, ev, profile)
 
         p = findings["predictive"]
         rc = findings["rootcause"]["candidate_cause"]

@@ -18,6 +18,7 @@ from ingest import (DATA_DIR, UPLOADS_DIR, load_corpus,
                     supported_upload_extensions)
 from kg import build_graph
 from knowledge_gaps import GapStore, load_experts, suggest_sme
+from maintenance_service import MaintenanceService
 from retrieval import HybridIndex
 
 app = FastAPI(title="AXON — Industrial Knowledge OS (MVP)")
@@ -32,6 +33,7 @@ system = AgentSystem(corpus, graph, index)
 gaps = GapStore(DATA_DIR / "knowledge_gaps.json")
 experts = load_experts(DATA_DIR / "experts.csv")
 conversations = ConversationStore(DATA_DIR / "conversations.json")
+maintenance = MaintenanceService(DATA_DIR)
 
 
 def _reingest():
@@ -478,11 +480,92 @@ async def upload(file: UploadFile = File(...)):
     n_chunks = sum(1 for c in corpus.chunks if c.doc_title == name or c.doc_no == (doc or ""))
     concepts = [n for n, d in graph.nodes.items()
                 if d.get("type") == "Concept" and d.get("source_doc") == doc]
+    # The document is now indexed into RAG (unchanged behaviour). Additionally
+    # classify it so the UI can decide whether to OFFER an Asset360 update.
+    # Asset360 is never modified here — this only detects and reports.
+    analysis = None
+    if doc:
+        try:
+            analysis = maintenance.analyze(corpus, graph, doc)
+        except Exception as e:  # classification must never fail an upload
+            analysis = {"error": f"{type(e).__name__}: {e}"}
     return {"ok": True, "doc_no": doc, "chunks_indexed": n_chunks,
             "graph_nodes": len(graph.nodes), "graph_edges": len(graph.edges),
             "concepts": concepts,
             "linked_assets": [e["source"] for e in graph.edges
-                              if e["rel"] == "DOCUMENTED_BY" and e["target"] == doc]}
+                              if e["rel"] == "DOCUMENTED_BY" and e["target"] == doc],
+            "classification": (analysis or {}).get("classification"),
+            "maintenance_detected": bool((analysis or {}).get("maintenance_detected")),
+            "candidate_assets": (analysis or {}).get("candidate_assets", [])}
+
+
+# --------------------------------------------------- Asset360 ingestion API
+
+class ExtractRequest(BaseModel):
+    doc_no: str
+    asset_ids: Optional[list[str]] = None
+
+
+class CommitRequest(BaseModel):
+    events: list[dict]
+
+
+@app.get("/api/uploads/{name}")
+def serve_upload(name: str):
+    """Serve an uploaded source file (PDF, image, ...) for the Asset360
+    source-traceability viewer. Path components are stripped to stay inside
+    the uploads directory."""
+    safe = Path(name).name
+    target = UPLOADS_DIR / safe
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, f"No such upload: {safe}")
+    return FileResponse(target)
+
+
+@app.post("/api/maintenance/analyze")
+def maintenance_analyze(req: ExtractRequest):
+    """Classify a document and report whether it carries maintenance info."""
+    if req.doc_no not in corpus.docs:
+        raise HTTPException(404, f"No such document: {req.doc_no}")
+    return maintenance.analyze(corpus, graph, req.doc_no)
+
+
+@app.post("/api/maintenance/extract")
+def maintenance_extract(req: ExtractRequest):
+    """Extract structured maintenance events for the preview dialog. Read-only:
+    nothing is written to Asset360."""
+    if req.doc_no not in corpus.docs:
+        raise HTTPException(404, f"No such document: {req.doc_no}")
+    return maintenance.preview(corpus, graph, req.doc_no, req.asset_ids)
+
+
+@app.post("/api/maintenance/commit")
+def maintenance_commit(req: CommitRequest):
+    """Validate and apply confirmed events to Asset360 live (no restart)."""
+    if not req.events:
+        raise HTTPException(400, "No events to commit")
+    result = maintenance.commit(corpus, graph, req.events, _reingest)
+    if not result.get("ok"):
+        return result
+    result["graph_nodes"] = len(graph.nodes)
+    result["graph_edges"] = len(graph.edges)
+    return result
+
+
+@app.get("/api/maintenance/events")
+def maintenance_events():
+    return {"events": maintenance.events()}
+
+
+@app.get("/api/maintenance/event/{event_id}")
+def maintenance_event(event_id: str):
+    ev = maintenance.get_event(event_id)
+    if ev is None:
+        raise HTTPException(404, f"No such event: {event_id}")
+    _, meta = _resolve_document(ev.get("source_document", ""))
+    ev = dict(ev)
+    ev["source_file"] = (meta or {}).get("source_file") or ev.get("source_document")
+    return ev
 
 
 if __name__ == "__main__":

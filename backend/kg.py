@@ -7,6 +7,7 @@ MEASURED_BY, DOCUMENTED_BY).
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 
 from ingest import Corpus
@@ -60,6 +61,7 @@ class KnowledgeGraph:
     #: how strongly each relationship type propagates relevance
     REL_WEIGHTS = {
         "CAUSED_BY": 1.0, "REQUIRES": 0.9, "GOVERNS": 0.9,
+        "HAS_FAILURE": 0.95, "USED_PART": 0.75, "RECOMMENDED": 0.7,
         "MEASURED_BY": 0.8, "CONNECTED_TO": 0.7, "PERFORMED_ON": 0.8,
         "DOCUMENTED_BY": 0.6, "MENTIONS": 0.5, "RELATED_TO": 0.4,
     }
@@ -206,7 +208,66 @@ def build_graph(corpus: Corpus) -> KnowledgeGraph:
             g.add_node("FM-BEARING-WEAR", "FailureMode", "Bearing wear / failure")
             g.add_edge(wo["wo_number"], "FM-BEARING-WEAR", "CAUSED_BY")
 
+    # Richer maintenance semantics (design doc): asset HAS_FAILURE mode,
+    # failure CAUSED_BY root cause, repair USED_PART, inspection RECOMMENDED
+    # action. Derived generically from every maintenance row (seeded + events
+    # extracted from uploaded documents), so an uploaded report immediately
+    # extends the graph. All calls are idempotent (add_node/add_edge dedupe).
+    _enrich_maintenance(g, corpus.maintenance)
+
     return g
+
+
+_NONE = {"", "none", "n/a", "na", "-", "scheduled pm"}
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "-", (text or "").strip()).strip("-").upper()
+
+
+def _parts_of(value: str) -> list[str]:
+    parts = []
+    for raw in re.split(r"[,;]", value or ""):
+        base = re.split(r"\s*x\s*\d+\s*$", raw.strip(), flags=re.I)[0].strip()
+        if base and base.lower() not in _NONE:
+            parts.append(base)
+    return parts
+
+
+def _enrich_maintenance(g: "KnowledgeGraph", maintenance: list[dict]) -> None:
+    for wo in maintenance:
+        wo_no = wo.get("wo_number", "")
+        equip = wo.get("equipment", "")
+        # An uploaded event may reference an asset not on the seeded P&ID.
+        if equip and equip not in g.nodes:
+            g.add_node(equip, "Equipment", equip)
+
+        failure = (wo.get("failure_mode") or "").strip()
+        fm_id = None
+        if failure.lower() not in _NONE:
+            fm_id = f"FM:{_slug(failure)}"
+            g.add_node(fm_id, "FailureMode", failure.title())
+            if equip in g.nodes:
+                g.add_edge(equip, fm_id, "HAS_FAILURE")
+            if wo_no in g.nodes:
+                g.add_edge(wo_no, fm_id, "CAUSED_BY")
+
+        cause = (wo.get("root_cause") or wo.get("cause") or "").strip()
+        if cause.lower() not in _NONE and fm_id:
+            cu_id = f"CAUSE:{_slug(cause)[:40]}"
+            g.add_node(cu_id, "Cause", cause[:60])
+            g.add_edge(fm_id, cu_id, "CAUSED_BY")
+
+        for part in _parts_of(wo.get("parts_used", "")):
+            g.add_node(part.upper(), "Part", part.upper())
+            if wo_no in g.nodes:
+                g.add_edge(wo_no, part.upper(), "USED_PART")
+
+        recommend = (wo.get("preventive_action") or "").strip()
+        if recommend.lower() not in _NONE and wo_no in g.nodes:
+            rc_id = f"REC:{_slug(recommend)[:40]}"
+            g.add_node(rc_id, "Recommendation", recommend[:60])
+            g.add_edge(wo_no, rc_id, "RECOMMENDED")
 
 
 # Small helper attached to Corpus for readability in build_graph

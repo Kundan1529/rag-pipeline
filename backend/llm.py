@@ -23,6 +23,9 @@ import threading
 import time
 from collections import defaultdict
 
+import response_engine
+from response_engine import ResponseProfile
+
 try:  # optional convenience: load HF/Anthropic tokens from axon/.env if present
     from dotenv import load_dotenv
     load_dotenv()
@@ -413,6 +416,13 @@ _SECTIONS = {
         "## Comparison\n\nA Markdown table with one row per aspect and one "
         "column per item being compared, then 2-3 sentences on the "
         "difference that actually matters. Cite each row.",
+    "Table":
+        "## Answer\n\nPresent the answer AS A MARKDOWN TABLE — this is the "
+        "user's required format. Choose the columns that best fit the content "
+        "(for a single subject use `Aspect | Detail`; for metrics use "
+        "`Metric | Value`). One row per key fact, each row carrying its inline "
+        "evidence citation. Add at most one short sentence before the table if "
+        "essential; put no prose after it.",
     "Steps":
         "## Steps\n\nThe procedure as a numbered list, in order, one action "
         "per step, each cited. Include prerequisites and safety "
@@ -429,12 +439,70 @@ _SECTIONS = {
         "## General Knowledge (Not from Retrieved Documents)\n\nONLY when "
         "retrieved evidence is insufficient and background would materially "
         "help. Never use CASE FILE citations here. Omit when unnecessary.",
+    "Key Takeaways":
+        "## Key Takeaways\n\n3-5 bullet points capturing the most important, "
+        "non-obvious conclusions. No repetition of wording used above.",
+    "Comparison":
+        "## Comparison\n\nA Markdown table with one row per aspect and one "
+        "column per item being compared, then 2-3 sentences on the difference "
+        "that actually matters. Cite each row.",
+    "Checklist":
+        "## Checklist\n\nAn actionable checklist using `- [ ]` items, one action "
+        "per line, in a sensible order. Cite items that rest on evidence.",
+    "Timeline":
+        "## Timeline\n\nA chronological list of the relevant events or "
+        "milestones, each dated where the evidence gives a date, and cited.",
+    "Flowchart":
+        "## Flowchart\n\nA process flow as a fenced ```mermaid `flowchart TD` "
+        "block using the evidence's steps, followed by a one-line explanation.",
+    "Real-World Example":
+        "## Real-World Example\n\nOne concrete, realistic example that shows "
+        "the concept in action. Keep it grounded; cite if drawn from evidence.",
+    "Analogy":
+        "## Analogy\n\nA short plain-language analogy that builds intuition. "
+        "Analogies are explanatory and need no citation.",
+    "Interview Notes":
+        "## Interview Notes\n\nCrisp question -> concise model-answer pairs a "
+        "candidate could revise from. Cite answers grounded in the evidence.",
+    "JSON":
+        "## JSON\n\nThe structured answer as a single fenced ```json code "
+        "block with clear keys. Keep values faithful to the evidence.",
+    "CSV":
+        "## CSV\n\nThe tabular data as a single fenced ```csv code block with "
+        "a header row. One record per line.",
     "Sources":
         "## Sources\n\nOnly the sources actually used, exactly as named in "
         "the CASE FILE. Never invent document names, pages or revisions.",
     "Suggested Follow-up Questions":
         "## Suggested Follow-up Questions\n\n2-3 short, genuinely useful "
         "next questions, each on its own line prefixed with \"- \".",
+}
+
+# Canonical section ordering — the adaptive template selects a SET of sections
+# per query (from intent + requested formats + length) and this orders them
+# into a coherent document. Sources + Follow-ups always close the answer.
+_SECTION_ORDER = [
+    "Table", "Executive Summary", "Direct Answer", "Comparison", "Steps",
+    "Flowchart", "Timeline", "Checklist", "Detailed Explanation",
+    "Real-World Example", "Analogy", "Interview Notes", "Key Takeaways",
+    "JSON", "CSV", "Limitations",
+    "General Knowledge (Not from Retrieved Documents)",
+    "Sources", "Suggested Follow-up Questions",
+]
+
+# Requested output-format tag -> the section it adds to the answer.
+_FORMAT_SECTION = {
+    "comparison": "Comparison",
+    "table": "Table",
+    "checklist": "Checklist",
+    "timeline": "Timeline",
+    "flowchart": "Flowchart",
+    "interview": "Interview Notes",
+    "json": "JSON",
+    "csv": "CSV",
+    "example": "Real-World Example",
+    "analogy": "Analogy",
+    "exec_summary": "Executive Summary",
 }
 
 # intent -> sections. Keys match QueryProcessor.detect_intent's labels.
@@ -458,63 +526,76 @@ _FORMAT_DEFAULT = ["Executive Summary", "Direct Answer",
                    "Detailed Explanation", "Sources"]
 
 
+def _coerce_profile(profile, style_directives) -> ResponseProfile | None:
+    """Accept either an adaptive ResponseProfile or a legacy directive list."""
+    if isinstance(profile, ResponseProfile):
+        return profile
+    if profile is not None:
+        return None
+    if style_directives:
+        return ResponseProfile.from_legacy_directives(style_directives)
+    return None
+
+
 def answer_sections(question_type: str | None,
+                    profile=None,
                     style_directives: list[str] | None = None) -> list[str]:
-    """The sections this answer should actually have."""
-    style = " ".join(style_directives or []).lower()
-    if "under roughly 120 words" in style:          # "keep it short"
-        return ["Direct Answer", "Sources"]
-    sections = list(_FORMAT_BY_INTENT.get(
-        (question_type or "").lower(), _FORMAT_DEFAULT))
-    if "markdown table" in style and "Comparison" not in sections:
-        sections.insert(max(0, len(sections) - 1), "Comparison")
-    if "thorough, step-by-step" in style:
-        for extra in ("Executive Summary", "Detailed Explanation"):
-            if extra not in sections:
-                sections.insert(len(sections) - 1, extra)
-    # Follow-ups close every answer; Sources is always last and appears
-    # once. (Every intent list already ends in Sources, so re-order rather
-    # than duplicate.)
-    sections = [s for s in sections if s != "Sources"]
-    sections += ["Sources", "Suggested Follow-up Questions"]
-    return sections
+    """The sections this answer should actually have — chosen dynamically from
+    the question intent, the requested output formats, and the requested
+    length (Dynamic Response Templates). Sources + Follow-ups always close it.
+    """
+    prof = _coerce_profile(profile, style_directives)
+    formats = set(prof.formats) if prof else set()
+    length = prof.length if prof else None
+    persona = prof.persona if prof else None
+
+    # Length "short" collapses to the leanest useful shape.
+    if length == "short":
+        base = ["Direct Answer"]
+    else:
+        base = list(_FORMAT_BY_INTENT.get(
+            (question_type or "").lower(), _FORMAT_DEFAULT))
+    sections = {s for s in base if s not in ("Sources",)}
+
+    # Requested output formats add their section(s).
+    for tag in formats:
+        sec = _FORMAT_SECTION.get(tag)
+        if sec:
+            sections.add(sec)
+
+    # Length shapes depth.
+    if length in ("detailed", "walkthrough", "research"):
+        sections.add("Detailed Explanation")
+    if length in ("walkthrough", "research"):
+        sections.add("Executive Summary")
+        sections.add("Key Takeaways")
+
+    # Personas that benefit from a worked illustration.
+    if persona == "teacher" and length != "short":
+        sections.add("Real-World Example")
+
+    sections.discard("Sources")
+    sections.discard("Suggested Follow-up Questions")
+    ordered = [s for s in _SECTION_ORDER
+               if s in sections and s not in ("Sources",
+                                              "Suggested Follow-up Questions")]
+    # Any custom/unknown section names from an intent list, kept in place.
+    for s in base:
+        if s not in ordered and s not in ("Sources",):
+            ordered.append(s)
+    return ordered + ["Sources", "Suggested Follow-up Questions"]
 
 
+# Legacy public helpers now delegate to the Adaptive Response Engine, so any
+# existing caller keeps working while the richer detection lives in one place.
 def detect_style_directives(query: str) -> list[str]:
-    """User-requested response-style directives found in the query.
-    Long inputs (repair instructions, pasted text) are never scanned —
-    style words inside them are not requests."""
-    if not query or len(query) > 300:
-        return []
-    return [directive for pattern, directive in _STYLE_RULES
-            if re.search(pattern, query, re.IGNORECASE)]
-
-
-# Optional lead-in before a style phrase ("give answers in points",
-# "keep it short", "please answer as a table").
-_STYLE_LEADIN = (r"[.,;]?\s*(?:please\s+)?(?:(?:give|answer|respond|reply|"
-                 r"explain|present|show|keep|make|write)\s+(?:me\s+)?"
-                 r"(?:the\s+)?(?:answers?|it|this|them)?\s*)?")
+    """User-requested response directives found in the query (delegated)."""
+    return response_engine.detect_style_directives(query)
 
 
 def strip_style_phrases(query: str) -> str:
-    """Remove style requests from the query text so they never reach
-    retrieval. 'tell me about the gpu-graph accelerator in points' left
-    'points' in the retrieval query and entity list, steering retrieval
-    toward the paper's 'point-wise' chunks; the style request belongs to
-    the PROMPT (detect_style_directives), not to search."""
-    if not query or len(query) > 300:
-        return query
-    out = query
-    for pattern, _ in _STYLE_RULES:
-        out = re.sub(_STYLE_LEADIN + r"(?:in|as|with)?\s*" + pattern,
-                     " ", out, flags=re.IGNORECASE)
-    out = re.sub(r"\s{2,}", " ", out).strip(" .,;?")
-    # A single surviving word is a perfectly good retrieval query
-    # ("explain attention in simple words" -> "attention"); only fall back
-    # to the raw text when stripping leaves NOTHING, which means the whole
-    # query was a style request with no subject of its own.
-    return out if out.split() else query
+    """Remove response-style phrases so they never reach retrieval (delegated)."""
+    return response_engine.strip_style_phrases(query)
 
 
 def _user_message(
@@ -522,6 +603,7 @@ def _user_message(
     case_file: str,
     *,
     question_type: str | None = None,
+    profile=None,
     style_directives: list[str] | None = None,
 ) -> str:
     # Only state the question type when the pipeline actually detected one.
@@ -529,21 +611,35 @@ def _user_message(
     # Current uploaded document") injected wrong metadata into every prompt
     # and contradicted the case file's own Intent line.
     qtype_line = f"\nQuestion Type: {question_type}" if question_type else ""
+    prof = _coerce_profile(profile, style_directives)
+    directives = list(prof.directives) if prof else list(style_directives or [])
     # Sections are chosen for THIS question rather than described as
     # optional in a fixed eight-section template the model then copies.
     answer_format = "\n\n".join(
         _SECTIONS[name] for name in
-        answer_sections(question_type, style_directives) if name in _SECTIONS)
+        answer_sections(question_type, prof) if name in _SECTIONS)
     style_block = ""
-    if style_directives:
-        rules = "\n".join(f"- {d}" for d in style_directives)
+    if directives:
+        rules = "\n".join(f"- {d}" for d in directives)
+        # A one-line banner of WHAT was detected makes the adaptivity legible.
+        detected = []
+        if prof:
+            if prof.persona:
+                detected.append(f"persona={prof.persona}")
+            if prof.reading_level:
+                detected.append(f"level={prof.reading_level}")
+            if prof.length:
+                detected.append(f"length={prof.length}")
+            if prof.formats:
+                detected.append(f"format={','.join(prof.formats)}")
+        banner = f"Detected: {', '.join(detected)}\n" if detected else ""
         style_block = (
             "\n========================================================\n"
             "USER-REQUESTED RESPONSE STYLE (takes precedence over the\n"
             "default answer format below, but never over grounding and\n"
             "citation rules)\n"
             "========================================================\n"
-            f"{rules}\n"
+            f"{banner}{rules}\n"
         )
 
     return f"""{style_block}
@@ -699,6 +795,25 @@ coverage metrics, or other internal pipeline diagnostics unless the user
 explicitly asks about them.
 """
 
+def _is_structural_failure(exc: Exception) -> bool:
+    """True when a provider failure will NOT recover within this session, so
+    the provider should be disabled outright rather than retried on a cooldown
+    timer. Covers depleted quota/credits (HTTP 402) and auth/permission
+    problems (401/403, or the anthropic 'could not resolve authentication
+    method' TypeError raised when no API key is configured). Transient trouble
+    (timeouts, 5xx, rate limits) is deliberately excluded — those still trip
+    the short cooldown breaker and retry."""
+    status = (getattr(exc, "status_code", None)
+              or getattr(getattr(exc, "response", None), "status_code", None))
+    if status in (401, 402, 403):
+        return True
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "payment required", "depleted", "insufficient credit",
+        "could not resolve authentication", "authentication method",
+        "invalid api key", "invalid x-api-key"))
+
+
 # ------------------------------------------------------------ HF provider
 
 _hf_client = None
@@ -751,12 +866,22 @@ def _try_hf(
         text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL)  # unclosed open tag
         return text.strip() or None, meta
     except Exception as e:
-        _trip_breaker("hf")  # skip HF for the cooldown window, then retry
+        if _is_structural_failure(e):
+            # Depleted credits (402) / auth: HF is dead for the session — stop
+            # re-attempting doomed ~multi-second calls; fall through to the
+            # next provider (or the deterministic floor) instantly from now on.
+            _hf_disabled = True
+            meta["skipped"] = "structural (quota/auth) — HF disabled for session"
+        else:
+            _trip_breaker("hf")  # transient: skip for the cooldown, then retry
         meta["error"] = f"{type(e).__name__}: {e}"
         print("=" * 80)
         print("HF Provider Error")
         print(type(e).__name__)
         print(e)
+        if _hf_disabled:
+            print("HF disabled for this session (quota/auth). "
+                  "Add credits or set another provider to restore live synthesis.")
         return None, meta
 
 
@@ -791,8 +916,13 @@ def _try_claude(
             meta["skipped"] = "anthropic package missing"
             return None, meta
         except Exception as e:
-            _trip_breaker("claude")
             _claude_client = None
+            if _is_structural_failure(e):
+                # No API key / bad key: Claude cannot recover this session.
+                _claude_disabled = True
+                meta["skipped"] = "no ANTHROPIC_API_KEY (structural)"
+            else:
+                _trip_breaker("claude")
             meta["error"] = f"probe: {type(e).__name__}"
             return None, meta
     try:
@@ -810,7 +940,11 @@ def _try_claude(
         text = "".join(b.text for b in resp.content if b.type == "text")
         return text or None, meta
     except Exception as e:
-        _trip_breaker("claude")
+        if _is_structural_failure(e):
+            _claude_disabled = True
+            meta["skipped"] = "structural (quota/auth) — Claude disabled for session"
+        else:
+            _trip_breaker("claude")
         meta["error"] = f"{type(e).__name__}: {e}"
         return None, meta
 
@@ -838,6 +972,7 @@ def synthesize(
     history: list | None = None,
     *,
     question_type: str | None = None,
+    profile=None,
     style_directives: list[str] | None = None,
 ) -> str | None:
     """
@@ -909,14 +1044,19 @@ def synthesize(
     # Build Final Prompt
     # ---------------------------------------------------------
 
+    # Prefer an explicit adaptive profile; fall back to a legacy directive
+    # list; otherwise analyse the query here so every call path is adaptive.
+    effective_profile = profile
+    if effective_profile is None and style_directives is None:
+        effective_profile = response_engine.analyze(query)
     user_message = (
         conversation
         + _user_message(
             query=query,
             case_file=case_file,
             question_type=question_type,
-            style_directives=(style_directives if style_directives is not None
-                              else detect_style_directives(query)),
+            profile=effective_profile,
+            style_directives=style_directives,
         )
     )
     print("=" * 80)
@@ -1037,11 +1177,36 @@ def synthesize_vanilla(query: str, context: str) -> str | None:
     return None
 
 
+def complete(user_msg: str, system_prompt: str | None = None) -> str | None:
+    """Route a single prompt to the first available provider and return the
+    raw completion (or None if no provider is configured).
+
+    A thin, side-effect-free helper for callers that need a one-shot
+    generation outside the RAG answer path — e.g. structured information
+    extraction. It reuses the same provider registry and fallback order as
+    synthesize(), so credentials/breaker state are honoured, but it does NOT
+    touch the global ACTIVE_PROVIDER or per-request generation record."""
+    for _name, fn, _label in _PROVIDERS:
+        try:
+            out, _meta = fn(user_msg, system_prompt)
+        except Exception:
+            continue
+        if out:
+            return out
+    return None
+
+
 def llm_available() -> bool:
-    """True if any real synthesis provider is configured (drives /api/status).
-    HF is judged by token presence (no network); Claude by a cached probe."""
-    if os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN") or os.getenv("HF_TOKEN"):
+    """True if any real synthesis provider is still usable (drives /api/status).
+    HF is judged by token presence (no network); Claude by a cached probe.
+    A provider disabled this session (depleted credits / missing key) no longer
+    counts, so /api/status honestly shows the deterministic fallback once the
+    live providers are exhausted."""
+    if not _hf_disabled and (os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+                             or os.getenv("HF_TOKEN")):
         return True
+    if _claude_disabled:
+        return False
     return _claude_probe()
 
 

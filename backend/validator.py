@@ -532,8 +532,14 @@ class AnswerValidator:
 
             "matched_terms":
                 result["matched_terms"],
+
+            # Exposed so downstream suppression can tell a well-grounded claim
+            # a weak model merely mis-cited (no contradiction) from a claim the
+            # evidence actively refutes (entity swap → high contradiction).
+            "nli_contradiction":
+                result.get("nli_contradiction"),
         }
-    
+
     def _assess_against_evidence(
     self,
     claim: str,

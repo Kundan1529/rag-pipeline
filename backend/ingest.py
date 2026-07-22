@@ -761,6 +761,26 @@ def load_corpus() -> Corpus:
 
     with open(DATA_DIR / "maintenance_log.csv") as f:
         maintenance = list(csv.DictReader(f))
+
+    # Overlay the structured maintenance_events store (history extracted from
+    # uploaded documents) on top of the legacy CSV, keyed by work order. Events
+    # carry richer fields (source_document, page_number, confidence, engineer,
+    # ...) so this both enriches their CSV mirror rows and adds any that are not
+    # yet mirrored — without ever double counting.
+    from history_repository import (MaintenanceEventRepository,
+                                    to_maintenance_row)
+    _repo = MaintenanceEventRepository(
+        DATA_DIR / "maintenance_events.json", DATA_DIR / "maintenance_log.csv")
+    _by_wo = {row.get("wo_number"): i for i, row in enumerate(maintenance)}
+    for _ev in _repo.all():
+        _row = to_maintenance_row(_ev)
+        _wo = _row["wo_number"]
+        if _wo in _by_wo:
+            maintenance[_by_wo[_wo]] = _row
+        else:
+            _by_wo[_wo] = len(maintenance)
+            maintenance.append(_row)
+
     with open(DATA_DIR / "spares.csv") as f:
         spares = list(csv.DictReader(f))
     with open(DATA_DIR / "sensors_p101.csv") as f:

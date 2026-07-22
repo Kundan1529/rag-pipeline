@@ -287,6 +287,10 @@ const Docs = {
         fetch(`${API}/api/conversations/${Conv.active}/documents/${encodeURIComponent(d.doc_no)}`, { method: "POST" });
       }
       Docs.refresh(); Status.refresh(); Graph.load();
+      // The document is indexed into RAG either way. If it looks like it
+      // carries maintenance information, offer to update Asset360 — never
+      // automatic; the user decides.
+      if (d.maintenance_detected && d.doc_no) Maintenance.begin(d);
     } catch (e) {
       toast(`Upload failed: ${e.message}`);
     } finally {
@@ -408,6 +412,18 @@ const Chat = {
     if (res.verdict) meta.innerHTML += `<span class="tagchip">${esc(String(res.verdict).split("—")[0].trim())}</span>`;
     if (res.answer_source) meta.innerHTML += `<span class="tagchip">${esc(res.answer_source)}</span>`;
 
+    // Adaptive Response Engine: show what style the answer was adapted to.
+    const rp = res.response_profile;
+    if (rp && rp.adaptive) {
+      const bits = [];
+      if (rp.persona) bits.push(["persona", rp.persona]);
+      if (rp.reading_level) bits.push(["level", rp.reading_level]);
+      if (rp.length) bits.push(["length", rp.length]);
+      if (rp.formats && rp.formats.length) bits.push(["format", rp.formats.join(", ")]);
+      for (const [k, v] of bits)
+        meta.innerHTML += `<span class="tagchip adapt" title="Adaptive Response Engine">${esc(k)}: ${esc(v)}</span>`;
+    }
+
     const srcBtn = document.createElement("button");
     srcBtn.className = "toggle"; srcBtn.textContent = `Sources (${(res.citations || []).length})`;
     const trcBtn = document.createElement("button");
@@ -441,10 +457,13 @@ const Chat = {
       bubble.appendChild(w);
     }
 
-    if (followups.length) {
+    // Prefer server-provided structured follow-ups (robust to the model
+    // omitting the section); fall back to those parsed from the answer text.
+    const fups = (res.followups && res.followups.length) ? res.followups : followups;
+    if (fups.length) {
       const f = document.createElement("div");
       f.className = "followups";
-      for (const q of followups) {
+      for (const q of fups) {
         const chip = document.createElement("button");
         chip.className = "fu"; chip.textContent = q;
         chip.onclick = () => { $("#q").value = q; Chat.send(); };
@@ -994,6 +1013,7 @@ window.addEventListener("load", () => {
   Conv.refresh();
   Graph.load();
   Asset360.init();
+  Maintenance.init();
   $("#glayout").value = prefs.layout;
   setInterval(() => Status.refresh(), 30000);
 });
@@ -1118,19 +1138,32 @@ const Asset360 = {
     }
 
     if (d.maintenance.failure_modes.length) {
+      Asset360._wos = d.maintenance.work_orders;
       cards.push(`<div class="a3-card">
         <h4>Failure history</h4>
         <div class="a3-chips" style="margin-bottom:9px">
           ${d.maintenance.failure_modes.map(f =>
             `<span class="a3-chip"><b>${f.count}×</b> ${esc(f.mode)}</span>`).join("")}
         </div>
-        ${d.maintenance.work_orders.map(w => `
-          <div class="a3-wo ${esc(w.type)}">
+        ${d.maintenance.work_orders.map((w, i) => {
+          const sourced = !!(w.source_document || w.from_document);
+          const conf = w.confidence != null && w.confidence !== ""
+            ? Math.round(Number(w.confidence) * 100) + "%" : "";
+          return `
+          <div class="a3-wo ${esc(w.type)} ${sourced ? "src" : ""}" data-idx="${i}"
+               ${sourced ? `title="From ${esc(w.source_document)} — click to view source"` : ""}>
             <div class="r1"><span class="wo">${esc(w.wo_number)}</span>
-              <span class="dt">${esc(w.date)} · ${esc(w.type)} · ${esc(w.downtime_hours)}h</span></div>
-            <div class="r2">${esc(w.symptom || "")}${w.cause ? " → <i>" + esc(w.cause) + "</i>" : ""}</div>
-            <div class="r2" style="color:var(--faint)">${esc(w.action || "")}</div>
-          </div>`).join("")}
+              <span class="dt">${esc(w.date)} · ${esc(w.type)} · ${esc(w.downtime_hours)}h</span>
+              ${sourced ? `<span class="srcbadge">▤ source</span>` : ""}</div>
+            <div class="r2">${esc(w.failure_mode || w.symptom || "")}${
+              (w.cause || w.root_cause) ? " → <i>" + esc(w.cause || w.root_cause) + "</i>" : ""}</div>
+            <div class="r2" style="color:var(--faint)">${esc(w.action || w.corrective_action || "")}</div>
+            ${sourced ? `<div class="r3">${[
+              w.engineer ? "👤 " + esc(w.engineer) : "",
+              w.source_document ? "▤ " + esc(w.source_document) + (w.page_number ? " p." + esc(String(w.page_number)) : "") : "",
+              conf ? "◈ " + conf : "",
+            ].filter(Boolean).join(" &nbsp;·&nbsp; ")}</div>` : ""}
+          </div>`; }).join("")}
       </div>`);
     }
 
@@ -1168,5 +1201,328 @@ const Asset360 = {
     }
 
     $("#a3-body").innerHTML = cards.join("");
+    // Source traceability: clicking a document-sourced work order opens the
+    // original PDF at the extracted page alongside the extracted fields.
+    $$("#a3-body .a3-wo.src").forEach((el) => {
+      el.onclick = () => Maintenance.openSource(Asset360._wos[Number(el.dataset.idx)]);
+    });
+  },
+};
+
+/* ------------------------------------------------------- Asset360 ingestion
+   The intelligent maintenance-ingestion workflow. After an upload, if the
+   backend classified the document as maintenance-related, this walks the user
+   through: detect → ask permission → (optionally choose assets) → extract →
+   review/edit with validation → confirm → live Asset360 update. Asset360 is
+   NEVER modified without an explicit Confirm here.
+   ------------------------------------------------------------------------- */
+const Maintenance = {
+  state: null,
+  editMode: false,
+
+  init() {
+    $("#mx-x").onclick = () => this.close();
+    $("#mx-backdrop").onclick = () => this.close();
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("#mx").hidden) this.close();
+    });
+  },
+
+  open(wide = false) {
+    $("#mx-dialog").classList.toggle("wide", wide);
+    $("#mx").hidden = false;
+  },
+  close() {
+    $("#mx").hidden = true;
+    $("#mx-body").innerHTML = "";
+    $("#mx-foot").innerHTML = "";
+    this.state = null; this.editMode = false;
+  },
+
+  setFoot(buttons) {
+    const foot = $("#mx-foot");
+    foot.innerHTML = "";
+    for (const b of buttons) {
+      const el = document.createElement("button");
+      el.className = `mx-btn ${b.cls || ""}`;
+      el.textContent = b.label;
+      if (b.disabled) el.disabled = true;
+      el.onclick = b.on;
+      foot.appendChild(el);
+    }
+  },
+
+  /* Stage 1 — detection + permission --------------------------------------- */
+  begin(d) {
+    this.state = {
+      docNo: d.doc_no,
+      title: d.classification?.title || d.doc_no,
+      classification: d.classification || {},
+      candidateAssets: d.candidate_assets || [],
+      events: null,
+    };
+    this.editMode = false;
+    this.open(false);
+    this.renderDetect();
+  },
+
+  renderDetect() {
+    const s = this.state, c = s.classification;
+    const conf = Math.round((c.confidence || 0) * 100);
+    $("#mx-title").textContent = "Asset360 ingestion";
+    $("#mx-sub").textContent = s.title;
+    $("#mx-body").innerHTML = `
+      <div class="mx-steps">
+        <div class="mx-step done"><div class="mx-dot">✓</div>
+          <div><span class="st">Document uploaded &amp; indexed into RAG</span>
+            <span class="sm">${esc(s.title)}</span></div></div>
+        <div class="mx-step done"><div class="mx-dot">✓</div>
+          <div><span class="st">Document classified</span>
+            <span class="sm"><span class="mx-type">${esc(c.type || "Document")}</span>
+              &nbsp;${conf}% confidence</span></div></div>
+        <div class="mx-step active"><div class="mx-dot">●</div>
+          <div><span class="st">Maintenance information detected</span>
+            <span class="sm">${s.candidateAssets.length
+              ? "References: " + s.candidateAssets.map(esc).join(", ")
+              : "No specific asset tag detected — you can set it during review"}</span></div></div>
+      </div>
+      <div class="mx-ask">
+        <h3>This document appears to contain maintenance information.</h3>
+        <p>Would you like to update Asset360 with the events in this document?
+           Choosing <b>Index only</b> keeps the current behaviour — the document
+           stays searchable in RAG and Asset360 is left unchanged.</p>
+      </div>`;
+    this.setFoot([
+      { label: "Index only", on: () => this.indexOnly() },
+      { label: "Update Asset360", cls: "primary", on: () => this.startUpdate() },
+    ]);
+  },
+
+  indexOnly() {
+    toast("Indexed into RAG only — Asset360 left unchanged.");
+    this.close();
+  },
+
+  /* Stage 2 — asset selection (bonus: multiple assets) --------------------- */
+  startUpdate() {
+    if ((this.state.candidateAssets || []).length > 1) {
+      this.renderAssetChooser();
+    } else {
+      this.extract(this.state.candidateAssets.length ? this.state.candidateAssets : null);
+    }
+  },
+
+  renderAssetChooser() {
+    const s = this.state;
+    $("#mx-title").textContent = "Choose assets";
+    $("#mx-body").innerHTML = `
+      <p style="color:var(--dim);font-size:13px;margin:0 0 4px">
+        This document references multiple assets. Select which asset(s) should
+        receive a maintenance history entry.</p>
+      <div class="mx-assets" id="mx-assets">
+        ${s.candidateAssets.map((a, i) => `
+          <label class="mx-asset"><input type="checkbox" value="${esc(a)}" checked>
+            <span class="tag">${esc(a)}</span></label>`).join("")}
+      </div>`;
+    this.setFoot([
+      { label: "Back", on: () => this.renderDetect() },
+      { label: "Extract selected", cls: "primary", on: () => {
+        const picked = $$("#mx-assets input:checked").map((i) => i.value);
+        if (!picked.length) { toast("Select at least one asset."); return; }
+        this.extract(picked);
+      } },
+    ]);
+  },
+
+  /* Stage 3 — extraction --------------------------------------------------- */
+  async extract(assetIds) {
+    $("#mx-title").textContent = "Extracting maintenance data";
+    $("#mx-sub").textContent = this.state.title;
+    $("#mx-body").innerHTML = `<div class="mx-load">⏳ Running information extraction…</div>`;
+    this.setFoot([]);
+    try {
+      const r = await fetch(`${API}/api/maintenance/extract`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ doc_no: this.state.docNo, asset_ids: assetIds }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "extraction failed");
+      this.state.events = d.events || [];
+      this.editMode = false;
+      if (!this.state.events.length) {
+        $("#mx-body").innerHTML = `<div class="mx-load">No maintenance events could be extracted from this document.</div>`;
+        this.setFoot([{ label: "Close", on: () => this.close() }]);
+        return;
+      }
+      this.renderPreview();
+    } catch (e) {
+      $("#mx-body").innerHTML = `<div class="mx-load">Extraction failed: ${esc(e.message)}</div>`;
+      this.setFoot([{ label: "Close", on: () => this.close() }]);
+    }
+  },
+
+  /* Stage 4 — preview / edit / validate ------------------------------------ */
+  FIELDS: [
+    ["asset_id", "Asset", false], ["date", "Date", false],
+    ["event_type", "Event", false], ["work_order", "Work order", false],
+    ["failure_mode", "Failure", false], ["severity", "Severity", false],
+    ["root_cause", "Cause", true], ["corrective_action", "Action", true],
+    ["preventive_action", "Preventive action", true],
+    ["parts_used", "Parts", false], ["downtime_hours", "Downtime (h)", false],
+    ["engineer", "Engineer", false], ["cost", "Cost", false],
+    ["source_document", "Source", false], ["page_number", "Page", false],
+  ],
+
+  confClass(v) { return v >= 0.85 ? "hi" : v >= 0.6 ? "mid" : "lo"; },
+
+  renderPreview() {
+    const s = this.state;
+    $("#mx-title").textContent = this.editMode ? "Edit maintenance data" : "Review extracted data";
+    $("#mx-sub").textContent = s.title;
+    this.open(true);
+
+    const cards = s.events.map((ev, i) => {
+      const conf = Number(ev.confidence || 0);
+      const findings = (ev.validation?.findings) || [];
+      const fields = this.FIELDS.map(([key, label, span]) => {
+        let val = ev[key];
+        if (key === "parts_used") val = Array.isArray(val) ? val.join(", ") : (val || "");
+        val = val == null ? "" : String(val);
+        const ro = this.editMode ? "" : "readonly";
+        return `<div class="mx-f ${span ? "span" : ""}">
+          <label>${label}</label>
+          <input data-ev="${i}" data-key="${key}" value="${esc(val)}" ${ro}
+            placeholder="—">
+        </div>`;
+      }).join("");
+      const findingHtml = findings.length
+        ? `<div class="mx-findings">${findings.map((f) => `
+            <div class="mx-find ${f.level}"><span class="ic">${f.level === "error" ? "✕" : "!"}</span>
+              <span>${esc(f.message)}</span></div>`).join("")}</div>`
+        : `<div class="mx-ok">✓ Validation passed — asset, parts, work order and date look consistent.</div>`;
+      return `<div class="mx-ev">
+        <div class="mx-ev-head">
+          <span class="mx-ev-asset">${esc(ev.asset_id || "—")}</span>
+          <span class="mx-conf ${this.confClass(conf)}">${Math.round(conf * 100)}% confidence</span>
+        </div>
+        <div class="mx-grid">${fields}</div>
+        ${findingHtml}
+      </div>`;
+    }).join("");
+
+    $("#mx-body").innerHTML = `
+      <p style="color:var(--dim);font-size:12.5px;margin:0 0 12px">
+        Nothing is written to Asset360 until you press <b>Confirm</b>.
+        ${this.editMode ? "Fields are editable — adjust anything, then confirm."
+          : "Review the extracted fields. Use <b>Edit</b> to correct anything."}</p>
+      ${cards}`;
+    this.setFoot([
+      { label: "Cancel", cls: "danger", on: () => this.close() },
+      { label: this.editMode ? "Done editing" : "Edit",
+        on: () => { this.collect(); this.editMode = !this.editMode; this.renderPreview(); } },
+      { label: "Confirm", cls: "primary", on: () => this.confirm() },
+    ]);
+  },
+
+  collect() {
+    // Pull any edits from the inputs back into state (works in both modes).
+    $$("#mx-body input[data-ev]").forEach((inp) => {
+      const ev = this.state.events[Number(inp.dataset.ev)];
+      const key = inp.dataset.key;
+      if (key === "parts_used") {
+        ev[key] = inp.value.split(",").map((x) => x.trim()).filter(Boolean);
+      } else if (key === "downtime_hours") {
+        ev[key] = parseFloat(inp.value) || 0;
+      } else {
+        ev[key] = inp.value;
+      }
+    });
+  },
+
+  /* Stage 5 — commit → live Asset360 update -------------------------------- */
+  async confirm() {
+    this.collect();
+    const payload = this.state.events.map((ev) => {
+      const { validation, ...clean } = ev;
+      return clean;
+    });
+    $("#mx-body").innerHTML = `<div class="mx-load">⏳ Updating Asset360 — history, timeline, spares and knowledge graph…</div>`;
+    this.setFoot([]);
+    try {
+      const r = await fetch(`${API}/api/maintenance/commit`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events: payload }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "commit failed");
+      if (!d.ok) {
+        // Blocking validation errors — surface and let the user edit.
+        this.editMode = true;
+        this.renderPreview();
+        const box = document.createElement("div");
+        box.className = "mx-findings";
+        box.innerHTML = (d.findings || []).map((f) => `
+          <div class="mx-find error"><span class="ic">✕</span><span>${esc(f.message)}</span></div>`).join("");
+        $("#mx-body").prepend(box);
+        toast(d.message || "Please resolve the validation errors.");
+        return;
+      }
+      const assets = d.asset_ids || [];
+      const spares = (d.spares_updated || []).length;
+      toast(`Asset360 updated: ${d.committed} event${d.committed > 1 ? "s" : ""}` +
+            (assets.length ? ` on ${assets.join(", ")}` : "") +
+            (spares ? `, ${spares} spare${spares > 1 ? "s" : ""} drawn down` : ""));
+      this.close();
+      // Live refresh — no backend restart.
+      Docs.refresh(); Status.refresh(); Graph.load();
+      if (assets.length) {
+        await Asset360.toggle(true);
+        const pick = $("#a3-pick");
+        if (pick && [...pick.options].some((o) => o.value === assets[0])) {
+          pick.value = assets[0];
+          await Asset360.load(assets[0]);
+        }
+      }
+    } catch (e) {
+      $("#mx-body").innerHTML = `<div class="mx-load">Update failed: ${esc(e.message)}</div>`;
+      this.setFoot([{ label: "Close", on: () => this.close() }]);
+    }
+  },
+
+  /* Source traceability — open the source PDF at the extracted page --------- */
+  async openSource(ev) {
+    this.open(true);
+    $("#mx-title").textContent = "Source traceability";
+    $("#mx-sub").textContent = ev.source_document || "";
+    const file = ev.source_document || "";
+    const page = ev.page_number || "";
+    const isPdf = /\.pdf$/i.test(file);
+    const url = file ? `${API}/api/uploads/${encodeURIComponent(file)}${isPdf && page ? "#page=" + encodeURIComponent(page) : ""}` : "";
+    const rows = [
+      ["Asset", ev.asset_id || ev.equipment], ["Date", ev.date],
+      ["Event", ev.event_type || ev.type],
+      ["Failure", ev.failure_mode], ["Cause", ev.root_cause || ev.cause],
+      ["Action", ev.corrective_action || ev.action],
+      ["Downtime", ev.downtime_hours != null ? ev.downtime_hours + " h" : ""],
+      ["Engineer", ev.engineer], ["Parts", Array.isArray(ev.parts_used) ? ev.parts_used.join(", ") : ev.parts_used],
+      ["Work order", ev.work_order || ev.wo_number], ["Page", page],
+      ["Confidence", ev.confidence != null ? Math.round(Number(ev.confidence) * 100) + "%" : ""],
+    ].filter(([, v]) => v);
+    $("#mx-body").innerHTML = `
+      <div class="mx-trace">
+        <div>${url
+          ? `<iframe src="${esc(url)}" title="Source document"></iframe>`
+          : `<div class="noframe">Source document not available.</div>`}
+          <div class="mx-note" style="color:var(--faint);font-size:11px;margin-top:7px">
+            Original document${page ? `, opened at page ${esc(String(page))}` : ""}.
+          </div>
+        </div>
+        <div class="fields">
+          <div style="font:600 9px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin-bottom:9px">Extracted fields</div>
+          ${rows.map(([k, v]) => `<div class="mx-f"><label>${esc(k)}</label>
+            <div class="val">${esc(String(v))}</div></div>`).join("")}
+        </div>
+      </div>`;
+    this.setFoot([{ label: "Close", on: () => this.close() }]);
   },
 };
